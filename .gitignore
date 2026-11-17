@@ -1,0 +1,19 @@
+# Build and publish outputs
+[Bb]in/
+[Oo]bj/
+publish/
+
+# Visual Studio / Rider cache
+.vs/
+.idea/
+*.user
+*.userosscache
+*.suo
+*.userprefs
+
+# Local app configuration
+config.json
+
+# Logs and temp files
+*.log
+*.tmp
