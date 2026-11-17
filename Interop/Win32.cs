@@ -25,6 +25,8 @@ namespace FocusGlow.Interop
         public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
 
         public const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+        public const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+        public const int DWMWA_SYSTEMBACKDROP_TYPE = 38;
 
         public const uint GA_PARENT = 1;
         public const uint GA_ROOT = 2;
@@ -43,20 +45,14 @@ namespace FocusGlow.Interop
         public const int WM_SYSKEYDOWN = 0x0104;
         public const int WM_SYSKEYUP = 0x0105;
 
-        public const int WM_MOUSEMOVE = 0x0200;
-        public const int WM_LBUTTONDOWN = 0x0201;
-        public const int WM_RBUTTONDOWN = 0x0204;
-        public const int WM_MBUTTONDOWN = 0x0207;
         public const int WM_XBUTTONDOWN = 0x020B;
-        public const int WM_XBUTTONUP = 0x020C;
 
         public const int XBUTTON1 = 0x0001;
         public const int XBUTTON2 = 0x0002;
 
-        public const int VK_ESCAPE = 0x1B;
         public const int VK_SHIFT = 0x10;
         public const int VK_CONTROL = 0x11;
-        public const int VK_MENU = 0x12; // Alt
+        public const int VK_MENU = 0x12;
         public const int VK_LWIN = 0x5B;
         public const int VK_RWIN = 0x5C;
 
@@ -69,12 +65,6 @@ namespace FocusGlow.Interop
         {
             public int X;
             public int Y;
-
-            public POINT(int x, int y)
-            {
-                X = x;
-                Y = y;
-            }
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -85,13 +75,8 @@ namespace FocusGlow.Interop
             public int Right;
             public int Bottom;
 
-            public int Width => Right - Left;
-            public int Height => Bottom - Top;
-
-            public bool Contains(int x, int y)
-            {
-                return x >= Left && x <= Right && y >= Top && y <= Bottom;
-            }
+            public bool Contains(int x, int y) =>
+                x >= Left && x <= Right && y >= Top && y <= Bottom;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -116,11 +101,7 @@ namespace FocusGlow.Interop
 
         #endregion
 
-        #region Delegates
-
         public delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
-
-        #endregion
 
         #region P/Invoke APIs
 
@@ -149,6 +130,10 @@ namespace FocusGlow.Interop
         public static extern bool IsZoomed(IntPtr hWnd);
 
         [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsIconic(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
         public static extern int GetSystemMetrics(int nIndex);
 
         [DllImport("user32.dll", SetLastError = true)]
@@ -164,17 +149,14 @@ namespace FocusGlow.Interop
         [DllImport("dwmapi.dll")]
         public static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out RECT pvAttribute, int cbAttribute);
 
+        [DllImport("dwmapi.dll")]
+        public static extern int DwmSetWindowAttribute(IntPtr hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
+
         [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
-        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
-
         [DllImport("user32.dll")]
         public static extern short GetAsyncKeyState(int vKey);
-
-        [DllImport("user32.dll")]
-        public static extern short GetKeyState(int vKey);
 
         [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         public static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
@@ -194,19 +176,10 @@ namespace FocusGlow.Interop
 
         #endregion
 
-        #region Helper Methods
-
         public static string GetWindowClassName(IntPtr hWnd)
         {
             var sb = new StringBuilder(256);
             GetClassName(hWnd, sb, sb.Capacity);
-            return sb.ToString();
-        }
-
-        public static string GetWindowTitle(IntPtr hWnd)
-        {
-            var sb = new StringBuilder(512);
-            GetWindowText(hWnd, sb, sb.Capacity);
             return sb.ToString();
         }
 
@@ -216,7 +189,5 @@ namespace FocusGlow.Interop
             string className = GetWindowClassName(hWnd);
             return className is "Progman" or "WorkerW" or "Shell_TrayWnd" or "Shell_SecondaryTrayWnd";
         }
-
-        #endregion
     }
 }

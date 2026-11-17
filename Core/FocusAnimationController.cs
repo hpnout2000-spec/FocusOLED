@@ -1,7 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
 using FocusGlow.Interop;
-using FocusGlow.Models;
 using FocusGlow.Physics;
 using FocusGlow.Services;
 using SkiaSharp;
@@ -19,43 +18,34 @@ namespace FocusGlow.Core
     public sealed class FocusAnimationController
     {
         public FocusState State { get; private set; } = FocusState.Inactive;
-
         public IntPtr TargetHwnd { get; private set; } = IntPtr.Zero;
-
-        // Current visual coordinates of target window on the canvas
         public SKRoundRect CurrentTargetRoundRect { get; private set; } = new();
 
-        public float CurrentDimOpacity { get; private set; } = 0.0f;
-        public float CurrentGlowAlpha { get; private set; } = 0.0f;
-        public float CurrentGlowProgress { get; private set; } = 0.0f;
-
+        public float CurrentDimOpacity { get; private set; }
+        public float CurrentGlowAlpha { get; private set; }
+        public float CurrentGlowProgress { get; private set; }
         public bool IsCursorInsideTarget { get; private set; } = true;
 
         public event Action? DeactivationCompleted;
 
-        // Phase 1 Glow state
-        private double _glowTimer = 0.0;
-        private double _glowDuration = 1.0;
+        private double _glowTimer;
+        private double _glowDuration = 0.85;
 
-        // Phase 2 & 3 Dimming transition state
-        private float _dimFromOpacity = 0.0f;
-        private float _dimTargetOpacity = 0.0f;
-        private double _dimTimer = 0.0;
+        private float _dimFromOpacity;
+        private float _dimTargetOpacity;
+        private double _dimTimer;
         private double _dimDuration = 0.45;
-        private bool _isTwoStageDimming = false;
-        private int _currentDimStage = 1; // 1 = 0->50%, 2 = 50->100%
+        private bool _isTwoStageDimming;
+        private int _currentDimStage = 1;
 
-        // Cursor exit transition
-        private float _cursorExitFromOpacity = 0.0f;
-        private double _cursorExitTimer = 0.0;
+        private float _cursorExitFromOpacity;
+        private double _cursorExitTimer;
         private double _cursorExitDuration = 0.22;
 
-        // Deactivation transition
-        private float _deactFromOpacity = 0.0f;
-        private double _deactTimer = 0.0;
-        private double _deactDuration = 0.22;
+        private float _deactFromOpacity;
+        private double _deactTimer;
+        private double _deactDuration = 0.20;
 
-        // Smoothing for window rect during resize/drag
         private float _smoothedLeft;
         private float _smoothedTop;
         private float _smoothedRight;
@@ -70,24 +60,26 @@ namespace FocusGlow.Core
 
             TargetHwnd = hwnd;
             State = FocusState.Activating;
+            IsCursorInsideTarget = true;
 
             var config = ConfigManager.Current;
-            _glowDuration = Math.Max(0.1, config.GlowDurationMs / 1000.0);
+            _glowDuration = Math.Clamp(config.GlowDurationMs / 1000.0, 0.4, 1.5);
+            if (Math.Abs(config.GlowDurationMs - 1000.0) < 1.0)
+                _glowDuration = 0.85; // более собранный, быстрый импульс по умолчанию
+
             _glowTimer = 0.0;
             CurrentGlowAlpha = 0.0f;
             CurrentGlowProgress = 0.0f;
 
-            // Initialize window coordinates
-            UpdateWindowCoordinates(instantSnap: true);
+            UpdateWindowCoordinates(instantSnap: true, dt: 0.016);
 
-            // Phase 2 two-stage dimming initialization
             CurrentDimOpacity = 0.0f;
             StartDimmingSequence(fromOpacity: 0.0f);
         }
 
         public void Deactivate()
         {
-            if (State == FocusState.Inactive || State == FocusState.Deactivating)
+            if (State is FocusState.Inactive or FocusState.Deactivating)
                 return;
 
             State = FocusState.Deactivating;
@@ -109,16 +101,13 @@ namespace FocusGlow.Core
 
             if (fromOpacity < 0.5f)
             {
-                // Stage 1: from current to 0.5
                 _currentDimStage = 1;
                 _dimTargetOpacity = 0.5f;
-                // Proportional duration for remaining fraction
                 float fraction = (0.5f - fromOpacity) / 0.5f;
                 _dimDuration = Math.Max(0.05, baseFast * fraction);
             }
             else
             {
-                // Stage 2: from current to 1.0
                 _currentDimStage = 2;
                 _dimTargetOpacity = 1.0f;
                 float fraction = (1.0f - fromOpacity) / 0.5f;
@@ -131,30 +120,21 @@ namespace FocusGlow.Core
             if (State == FocusState.Inactive)
                 return;
 
-            // 1. Verify target window validity
-            if (!Win32.IsWindow(TargetHwnd) || !Win32.IsWindowVisible(TargetHwnd))
+            if (!Win32.IsWindow(TargetHwnd) || !Win32.IsWindowVisible(TargetHwnd) || Win32.IsIconic(TargetHwnd))
             {
                 Deactivate();
             }
 
-            // 2. Real-time window bounds tracking
-            UpdateWindowCoordinates(instantSnap: false);
-
-            // 3. Phase 1: Glow comet update
+            UpdateWindowCoordinates(instantSnap: false, dt: dt);
             UpdateGlowPhase(dt);
-
-            // 4. Cursor tracking & Phase 3 reaction
             UpdateCursorReaction(dt);
 
-            // 5. Check deactivation completion
             if (State == FocusState.Deactivating)
             {
                 _deactTimer += dt;
                 float t = Math.Clamp((float)(_deactTimer / _deactDuration), 0f, 1f);
                 float eased = CubicBezier.AppleDecel.Evaluate(t);
                 CurrentDimOpacity = Math.Clamp(_deactFromOpacity * (1.0f - eased), 0f, 1f);
-
-                // Fade out any remaining glow
                 CurrentGlowAlpha = Math.Clamp(CurrentGlowAlpha * (1.0f - eased), 0f, 1f);
 
                 if (t >= 1.0f && CurrentDimOpacity <= 0.001f && CurrentGlowAlpha <= 0.001f)
@@ -176,21 +156,18 @@ namespace FocusGlow.Core
                 float p = Math.Clamp((float)(_glowTimer / _glowDuration), 0f, 1f);
                 CurrentGlowProgress = p;
 
-                // Alpha envelope:
-                // 0.00 - 0.15: Fade in (0 -> 1)
-                // 0.15 - 0.65: Full brightness (1.0)
-                // 0.65 - 1.00: Fade out / dissolve (1 -> 0)
-                if (p < 0.15f)
+                // Мягкое появление за 12%, удержание до 52%, затем полное растворение к концу первой фазы затемнения
+                if (p < 0.12f)
                 {
-                    CurrentGlowAlpha = p / 0.15f;
+                    CurrentGlowAlpha = CubicBezier.EaseOut.Evaluate(p / 0.12f);
                 }
-                else if (p <= 0.65f)
+                else if (p <= 0.52f)
                 {
                     CurrentGlowAlpha = 1.0f;
                 }
                 else
                 {
-                    float dissolveT = (p - 0.65f) / 0.35f;
+                    float dissolveT = (p - 0.52f) / 0.48f;
                     CurrentGlowAlpha = 1.0f - CubicBezier.AppleDecel.Evaluate(dissolveT);
                 }
             }
@@ -209,10 +186,8 @@ namespace FocusGlow.Core
             if (State == FocusState.Deactivating)
                 return;
 
-            // Get physical cursor position
             Win32.GetCursorPos(out Win32.POINT cursorPt);
 
-            // Get target window physical bounds
             int hr = Win32.DwmGetWindowAttribute(TargetHwnd, Win32.DWMWA_EXTENDED_FRAME_BOUNDS, out Win32.RECT winRect, Marshal.SizeOf<Win32.RECT>());
             bool inside = hr == 0 && winRect.Contains(cursorPt.X, cursorPt.Y);
 
@@ -221,12 +196,10 @@ namespace FocusGlow.Core
 
             if (inside != IsCursorInsideTarget)
             {
-                // Cursor transitioned between inside and outside
                 IsCursorInsideTarget = inside;
 
                 if (!inside)
                 {
-                    // Cursor LEFT target window: smoothly fade dimming down to 0%
                     _cursorExitFromOpacity = CurrentDimOpacity;
                     _cursorExitTimer = 0.0;
                     _cursorExitDuration = exitDuration;
@@ -234,15 +207,12 @@ namespace FocusGlow.Core
                 }
                 else
                 {
-                    // Cursor RETURNED to target window:
-                    // Resume two-stage dimming from current intermediate opacity towards 50% then 100%
                     StartDimmingSequence(fromOpacity: CurrentDimOpacity);
                 }
             }
 
             if (!IsCursorInsideTarget)
             {
-                // Smooth deceleration down to 0% (~220 ms)
                 _cursorExitTimer += dt;
                 float t = Math.Clamp((float)(_cursorExitTimer / _cursorExitDuration), 0f, 1f);
                 float eased = CubicBezier.AppleDecel.Evaluate(t);
@@ -250,7 +220,6 @@ namespace FocusGlow.Core
             }
             else if (_isTwoStageDimming)
             {
-                // Two-stage dimming sequence
                 _dimTimer += dt;
                 float t = Math.Clamp((float)(_dimTimer / _dimDuration), 0f, 1f);
                 float eased = CubicBezier.AppleDecel.Evaluate(t);
@@ -261,7 +230,6 @@ namespace FocusGlow.Core
                 {
                     if (_currentDimStage == 1)
                     {
-                        // Transition to Stage 2: 50% -> 100% over ~1.5s
                         _currentDimStage = 2;
                         _dimFromOpacity = 0.5f;
                         _dimTargetOpacity = 1.0f;
@@ -271,7 +239,6 @@ namespace FocusGlow.Core
                     }
                     else
                     {
-                        // Succeeded 100% deep dimming
                         CurrentDimOpacity = 1.0f;
                         _isTwoStageDimming = false;
                     }
@@ -279,14 +246,13 @@ namespace FocusGlow.Core
             }
         }
 
-        private void UpdateWindowCoordinates(bool instantSnap)
+        private void UpdateWindowCoordinates(bool instantSnap, double dt)
         {
             if (TargetHwnd == IntPtr.Zero) return;
 
             int hr = Win32.DwmGetWindowAttribute(TargetHwnd, Win32.DWMWA_EXTENDED_FRAME_BOUNDS, out Win32.RECT winRect, Marshal.SizeOf<Win32.RECT>());
             if (hr != 0) return;
 
-            // Virtual screen offset in physical pixels
             int vx = Win32.GetSystemMetrics(Win32.SM_XVIRTUALSCREEN);
             int vy = Win32.GetSystemMetrics(Win32.SM_YVIRTUALSCREEN);
 
@@ -295,16 +261,20 @@ namespace FocusGlow.Core
             float localRight = winRect.Right - vx;
             float localBottom = winRect.Bottom - vy;
 
-            // Windows 11 rounded corners logic:
-            // Maximized window -> 0px radius. Normal window -> 8px base (scaled by DPI).
             bool isZoomed = Win32.IsZoomed(TargetHwnd);
             float targetRadius = 0f;
             if (!isZoomed)
             {
+                // Компенсация 1px DWM-асимметрии Windows 11:
+                // DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) на Win11
+                // захватывает лишний 1px с левого, верхнего и нижнего краёв.
+                localLeft += 1f;
+                localTop += 1f;
+                localBottom -= 1f;
+
                 uint dpi = Win32.GetDpiForWindow(TargetHwnd);
                 if (dpi == 0) dpi = 96;
-                float dpiScale = dpi / 96f;
-                targetRadius = ConfigManager.Current.CornerRadius * dpiScale;
+                targetRadius = ConfigManager.Current.CornerRadius * (dpi / 96f);
             }
 
             if (instantSnap)
@@ -318,20 +288,28 @@ namespace FocusGlow.Core
             }
             else
             {
-                // Snappy 40ms damp for silky tracking during window drag/resize
-                const float smoothTime = 0.035f;
-                const float maxSpeed = 8000f;
-                float dt = 0.016f;
+                const float smoothTime = 0.025f;
+                const float maxSpeed = 12000f;
+                float fdt = (float)Math.Clamp(dt, 0.001, 0.05);
 
-                _smoothedLeft = SmoothDamp.Update(_smoothedLeft, localLeft, ref _velLeft, smoothTime, maxSpeed, dt);
-                _smoothedTop = SmoothDamp.Update(_smoothedTop, localTop, ref _velTop, smoothTime, maxSpeed, dt);
-                _smoothedRight = SmoothDamp.Update(_smoothedRight, localRight, ref _velRight, smoothTime, maxSpeed, dt);
-                _smoothedBottom = SmoothDamp.Update(_smoothedBottom, localBottom, ref _velBottom, smoothTime, maxSpeed, dt);
-                _smoothedRadius = SmoothDamp.Update(_smoothedRadius, targetRadius, ref _velRadius, smoothTime, maxSpeed, dt);
+                _smoothedLeft = SmoothDamp.Update(_smoothedLeft, localLeft, ref _velLeft, smoothTime, maxSpeed, fdt);
+                _smoothedTop = SmoothDamp.Update(_smoothedTop, localTop, ref _velTop, smoothTime, maxSpeed, fdt);
+                _smoothedRight = SmoothDamp.Update(_smoothedRight, localRight, ref _velRight, smoothTime, maxSpeed, fdt);
+                _smoothedBottom = SmoothDamp.Update(_smoothedBottom, localBottom, ref _velBottom, smoothTime, maxSpeed, fdt);
+                _smoothedRadius = SmoothDamp.Update(_smoothedRadius, targetRadius, ref _velRadius, smoothTime, maxSpeed, fdt);
+
+                // Мгновенная фиксация к целым пикселям в покое для исключения субпиксельного размытия сглаживания
+                if (Math.Abs(_smoothedLeft - localLeft) < 0.25f) _smoothedLeft = localLeft;
+                if (Math.Abs(_smoothedTop - localTop) < 0.25f) _smoothedTop = localTop;
+                if (Math.Abs(_smoothedRight - localRight) < 0.25f) _smoothedRight = localRight;
+                if (Math.Abs(_smoothedBottom - localBottom) < 0.25f) _smoothedBottom = localBottom;
+                if (Math.Abs(_smoothedRadius - targetRadius) < 0.1f) _smoothedRadius = targetRadius;
             }
 
-            var skRect = new SKRect(_smoothedLeft, _smoothedTop, _smoothedRight, _smoothedBottom);
-            CurrentTargetRoundRect = new SKRoundRect(skRect, _smoothedRadius, _smoothedRadius);
+            CurrentTargetRoundRect = new SKRoundRect(
+                new SKRect(_smoothedLeft, _smoothedTop, _smoothedRight, _smoothedBottom),
+                _smoothedRadius,
+                _smoothedRadius);
         }
     }
 }

@@ -1,5 +1,4 @@
 using System;
-using FocusGlow.Interop;
 using FocusGlow.Physics;
 using SkiaSharp;
 
@@ -7,27 +6,42 @@ namespace FocusGlow.Rendering
 {
     public sealed class FocusOverlayRenderer : IDisposable
     {
-        private static readonly SKColor[] AppleGeminiColors = new[]
+        // Направленный оптический блик: 65% периметра остаются тёмными,
+        // ядро — чистый жемчужно-белый свет, по краям — деликатная хроматическая дисперсия.
+        private static readonly SKColor[] OpticalColors =
         {
-            new SKColor(0x42, 0x85, 0xF4), // Google Blue / Electric Azure
-            new SKColor(0x9B, 0x72, 0xCB), // Gemini Purple / Orchid
-            new SKColor(0xD9, 0x65, 0x70), // Coral Pink / Rose
-            new SKColor(0xF4, 0xAF, 0x5F), // Amber Glow / Sunset
-            new SKColor(0x42, 0x85, 0xF4)  // Seamless loop to start
+            new(255, 255, 255, 0),
+            new(255, 255, 255, 0),
+            new(168, 199, 250, 48),   // Лёгкий ледяной оттенок в хвосте
+            new(203, 184, 248, 135),  // Мягкая лавандовая дисперсия
+            new(255, 255, 255, 255),  // Чистое белое ядро блика
+            new(245, 224, 198, 165),  // Тёплый перламутровый фронт
+            new(168, 199, 250, 40),   // Мягкое затухание впереди
+            new(255, 255, 255, 0),
+            new(255, 255, 255, 0)
         };
 
-        private static readonly float[] ColorPositions = new[] { 0.0f, 0.25f, 0.5f, 0.75f, 1.0f };
+        private static readonly float[] OpticalPositions =
+        {
+            0.00f,
+            0.22f,
+            0.31f,
+            0.39f,
+            0.46f,
+            0.52f,
+            0.58f,
+            0.66f,
+            1.00f
+        };
 
-        // Preallocated paints and filters for maximum GPU/rendering performance
         private readonly SKPaint _dimPaint;
-        private readonly SKPaint _outerBloomPaint;
-        private readonly SKPaint _midBloomPaint;
-        private readonly SKPaint _coreGlowPaint;
-        private readonly SKPaint _crispEdgePaint;
+        private readonly SKPaint _ambientHaloPaint;
+        private readonly SKPaint _opticalBloomPaint;
+        private readonly SKPaint _specularHairlinePaint;
 
-        private readonly SKMaskFilter _outerBlurFilter;
-        private readonly SKMaskFilter _midBlurFilter;
-        private readonly SKMaskFilter _coreBlurFilter;
+        private readonly SKMaskFilter _ambientBlurFilter;
+        private readonly SKMaskFilter _bloomBlurFilter;
+        private readonly SKPath _contourPath = new();
 
         public FocusOverlayRenderer()
         {
@@ -38,46 +52,32 @@ namespace FocusGlow.Rendering
                 IsAntialias = true
             };
 
-            _outerBlurFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, 18f);
-            _midBlurFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, 8f);
-            _coreBlurFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, 2.5f);
+            _ambientBlurFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, 10f);
+            _bloomBlurFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, 2.8f);
 
-            _outerBloomPaint = new SKPaint
+            // Слой 3: еле уловимый атмосферный отсвет (пик ~12%)
+            _ambientHaloPaint = new SKPaint
             {
                 Style = SKPaintStyle.Stroke,
-                StrokeWidth = 32f,
-                StrokeCap = SKStrokeCap.Round,
-                StrokeJoin = SKStrokeJoin.Round,
+                StrokeWidth = 11f,
                 IsAntialias = true,
-                MaskFilter = _outerBlurFilter
+                MaskFilter = _ambientBlurFilter
             };
 
-            _midBloomPaint = new SKPaint
+            // Слой 2: узкое оптическое рассеивание вдоль грани (пик ~38%)
+            _opticalBloomPaint = new SKPaint
             {
                 Style = SKPaintStyle.Stroke,
-                StrokeWidth = 16f,
-                StrokeCap = SKStrokeCap.Round,
-                StrokeJoin = SKStrokeJoin.Round,
+                StrokeWidth = 3.5f,
                 IsAntialias = true,
-                MaskFilter = _midBlurFilter
+                MaskFilter = _bloomBlurFilter
             };
 
-            _coreGlowPaint = new SKPaint
+            // Слой 1: острая как бритва световая нить строго по геометрии окна
+            _specularHairlinePaint = new SKPaint
             {
                 Style = SKPaintStyle.Stroke,
-                StrokeWidth = 5f,
-                StrokeCap = SKStrokeCap.Round,
-                StrokeJoin = SKStrokeJoin.Round,
-                IsAntialias = true,
-                MaskFilter = _coreBlurFilter
-            };
-
-            _crispEdgePaint = new SKPaint
-            {
-                Style = SKPaintStyle.Stroke,
-                StrokeWidth = 2f,
-                StrokeCap = SKStrokeCap.Round,
-                StrokeJoin = SKStrokeJoin.Round,
+                StrokeWidth = 1.25f,
                 IsAntialias = true
             };
         }
@@ -91,125 +91,71 @@ namespace FocusGlow.Rendering
             float glowAlpha,
             float glowProgress)
         {
-            // 1. Clear to transparent
             canvas.Clear(SKColors.Transparent);
 
-            // 2. Render Phase 2: Background Dimming with active window cut out
+            // Затемнение всего пространства вокруг активного окна
             if (dimOpacity > 0.001f)
             {
                 canvas.Save();
-                // Clip out the target window using difference operation with antialiased rounded corners
                 canvas.ClipRoundRect(targetWindowRect, SKClipOperation.Difference, antialias: true);
 
                 byte alphaByte = (byte)Math.Clamp((int)(dimOpacity * 255f), 0, 255);
                 _dimPaint.Color = new SKColor(0, 0, 0, alphaByte);
-
                 canvas.DrawRect(0, 0, canvasWidth, canvasHeight, _dimPaint);
                 canvas.Restore();
             }
 
-            // 3. Render Phase 1: Gemini / Apple Intelligence contour glow ("comet" + multi-pass bloom)
+            // Оптический световой импульс по грани окна
             if (glowAlpha > 0.001f && targetWindowRect.Width > 10 && targetWindowRect.Height > 10)
             {
-                DrawContourGlow(canvas, targetWindowRect, glowAlpha, glowProgress);
+                DrawOpticalSweep(canvas, targetWindowRect, glowAlpha, glowProgress);
             }
         }
 
-        private void DrawContourGlow(
+        private void DrawOpticalSweep(
             SKCanvas canvas,
             SKRoundRect targetRect,
             float glowAlpha,
             float glowProgress)
         {
-            using var basePath = new SKPath();
-            basePath.AddRoundRect(targetRect, SKPathDirection.Clockwise);
+            _contourPath.Rewind();
+            _contourPath.AddRoundRect(targetRect, SKPathDirection.Clockwise);
 
-            using var measure = new SKPathMeasure(basePath, false);
-            float totalLength = measure.Length;
-            if (totalLength <= 1f) return;
+            // Асимметричное замедление в духе macOS / Apple Intelligence
+            float easedProgress = CubicBezier.AppleDecel.Evaluate(glowProgress);
+            float rotationAngle = -55f + easedProgress * 360f;
 
-            // Comet covers ~40% of the perimeter as a long fading tail
-            float tailLength = totalLength * 0.40f;
-            float headDist = glowProgress * totalLength * 1.35f; // sweeps 1.35 circuits
-            float startDist = headDist - tailLength;
-
-            using var cometPath = new SKPath();
-            ExtractLoopSegment(measure, startDist, headDist, totalLength, cometPath);
-
-            // Dynamic rotation for sweep gradient centered at active window
             var center = new SKPoint(targetRect.Rect.MidX, targetRect.Rect.MidY);
-            float rotationAngle = (headDist / totalLength) * 360f;
+            var matrix = SKMatrix.CreateRotationDegrees(rotationAngle, center.X, center.Y);
 
-            var localMatrix = SKMatrix.CreateRotationDegrees(rotationAngle, center.X, center.Y);
-            using var shader = SKShader.CreateSweepGradient(center, AppleGeminiColors, ColorPositions, localMatrix);
+            using var shader = SKShader.CreateSweepGradient(center, OpticalColors, OpticalPositions, matrix);
 
-            // Outer Bloom Pass (Soft atmospheric glow)
-            _outerBloomPaint.Shader = shader;
-            _outerBloomPaint.Color = new SKColor(255, 255, 255, (byte)Math.Clamp((int)(0.35f * glowAlpha * 255f), 0, 255));
-            canvas.DrawPath(cometPath, _outerBloomPaint);
+            _ambientHaloPaint.Shader = shader;
+            _ambientHaloPaint.Color = new SKColor(255, 255, 255, (byte)Math.Clamp((int)(0.13f * glowAlpha * 255f), 0, 255));
+            canvas.DrawPath(_contourPath, _ambientHaloPaint);
 
-            // Mid Bloom Pass (Medium intense aura)
-            _midBloomPaint.Shader = shader;
-            _midBloomPaint.Color = new SKColor(255, 255, 255, (byte)Math.Clamp((int)(0.60f * glowAlpha * 255f), 0, 255));
-            canvas.DrawPath(cometPath, _midBloomPaint);
+            _opticalBloomPaint.Shader = shader;
+            _opticalBloomPaint.Color = new SKColor(255, 255, 255, (byte)Math.Clamp((int)(0.38f * glowAlpha * 255f), 0, 255));
+            canvas.DrawPath(_contourPath, _opticalBloomPaint);
 
-            // Neon Core Laser Pass (Sharp vibrant beam)
-            _coreGlowPaint.Shader = shader;
-            _coreGlowPaint.Color = new SKColor(255, 255, 255, (byte)Math.Clamp((int)(0.95f * glowAlpha * 255f), 0, 255));
-            canvas.DrawPath(cometPath, _coreGlowPaint);
+            _specularHairlinePaint.Shader = shader;
+            _specularHairlinePaint.Color = new SKColor(255, 255, 255, (byte)Math.Clamp((int)(0.92f * glowAlpha * 255f), 0, 255));
+            canvas.DrawPath(_contourPath, _specularHairlinePaint);
 
-            // Core Precision Highlight (Crisp ultra-thin ribbon)
-            _crispEdgePaint.Shader = shader;
-            _crispEdgePaint.Color = new SKColor(255, 255, 255, (byte)Math.Clamp((int)(1.0f * glowAlpha * 255f), 0, 255));
-            canvas.DrawPath(cometPath, _crispEdgePaint);
-
-            _outerBloomPaint.Shader = null;
-            _midBloomPaint.Shader = null;
-            _coreGlowPaint.Shader = null;
-            _crispEdgePaint.Shader = null;
-        }
-
-        private static void ExtractLoopSegment(
-            SKPathMeasure measure,
-            float start,
-            float end,
-            float totalLength,
-            SKPath dst)
-        {
-            if (totalLength <= 0.0f) return;
-
-            // Wrap distances to [0, totalLength)
-            float normStart = start;
-            float normEnd = end;
-
-            while (normStart < 0) normStart += totalLength;
-            while (normEnd < 0) normEnd += totalLength;
-            normStart %= totalLength;
-            normEnd %= totalLength;
-
-            if (normStart <= normEnd)
-            {
-                measure.GetSegment(normStart, normEnd, dst, true);
-            }
-            else
-            {
-                // Segment wraps across the seam
-                measure.GetSegment(normStart, totalLength, dst, true);
-                measure.GetSegment(0f, normEnd, dst, true);
-            }
+            _ambientHaloPaint.Shader = null;
+            _opticalBloomPaint.Shader = null;
+            _specularHairlinePaint.Shader = null;
         }
 
         public void Dispose()
         {
+            _contourPath.Dispose();
             _dimPaint.Dispose();
-            _outerBloomPaint.Dispose();
-            _midBloomPaint.Dispose();
-            _coreGlowPaint.Dispose();
-            _crispEdgePaint.Dispose();
-
-            _outerBlurFilter.Dispose();
-            _midBlurFilter.Dispose();
-            _coreBlurFilter.Dispose();
+            _ambientHaloPaint.Dispose();
+            _opticalBloomPaint.Dispose();
+            _specularHairlinePaint.Dispose();
+            _ambientBlurFilter.Dispose();
+            _bloomBlurFilter.Dispose();
         }
     }
 }

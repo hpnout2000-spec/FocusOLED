@@ -1,5 +1,4 @@
 using System;
-using System.Windows;
 using FocusGlow.Interop;
 using FocusGlow.Views;
 using Application = System.Windows.Application;
@@ -19,30 +18,22 @@ namespace FocusGlow.Core
         {
             _controller = controller;
             _overlayWindow = overlayWindow;
-
             _controller.DeactivationCompleted += OnDeactivationCompleted;
         }
 
         public void ToggleFocus()
         {
             if (IsFocusActive)
-            {
                 DeactivateFocus();
-            }
             else
-            {
                 ActivateFocusUnderCursor();
-            }
         }
 
         public void ActivateFocusUnderCursor()
         {
             IntPtr targetHwnd = FindTopLevelWindowUnderCursor();
             if (targetHwnd == IntPtr.Zero)
-            {
-                // Cursor is over desktop, taskbar, or no valid window found
                 return;
-            }
 
             ActivateFocus(targetHwnd);
         }
@@ -52,7 +43,7 @@ namespace FocusGlow.Core
             if (targetHwnd == IntPtr.Zero || !Win32.IsWindow(targetHwnd))
                 return;
 
-            Application.Current.Dispatcher.Invoke(() =>
+            Application.Current.Dispatcher.BeginInvoke(() =>
             {
                 _overlayWindow.ActivateOverlay(targetHwnd);
                 FocusStateChanged?.Invoke(true);
@@ -63,7 +54,7 @@ namespace FocusGlow.Core
         {
             if (!IsFocusActive) return;
 
-            Application.Current.Dispatcher.Invoke(() =>
+            Application.Current.Dispatcher.BeginInvoke(() =>
             {
                 _controller.Deactivate();
             });
@@ -71,7 +62,7 @@ namespace FocusGlow.Core
 
         private void OnDeactivationCompleted()
         {
-            Application.Current.Dispatcher.Invoke(() =>
+            Application.Current.Dispatcher.BeginInvoke(() =>
             {
                 _overlayWindow.DeactivateOverlay();
                 FocusStateChanged?.Invoke(false);
@@ -87,17 +78,11 @@ namespace FocusGlow.Core
             if (pointHwnd == IntPtr.Zero)
                 return IntPtr.Zero;
 
-            // Get root ancestor window
             IntPtr rootHwnd = Win32.GetAncestor(pointHwnd, Win32.GA_ROOT);
             if (rootHwnd == IntPtr.Zero)
                 rootHwnd = pointHwnd;
 
-            // Validate window
-            if (!Win32.IsWindowVisible(rootHwnd))
-                return IntPtr.Zero;
-
-            // Ignore desktop and taskbar
-            if (Win32.IsDesktopOrTaskbar(rootHwnd))
+            if (!Win32.IsWindowVisible(rootHwnd) || Win32.IsDesktopOrTaskbar(rootHwnd))
                 return IntPtr.Zero;
 
             return rootHwnd;

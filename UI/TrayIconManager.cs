@@ -23,12 +23,12 @@ namespace FocusGlow.UI
 
             _notifyIcon = new NotifyIcon
             {
-                Text = "FocusGlow — Режим фокуса Windows 11",
+                Text = "FocusGlow",
                 Visible = true,
                 Icon = CreateTrayIcon()
             };
 
-            _notifyIcon.DoubleClick += (s, e) => _openSettingsAction();
+            _notifyIcon.DoubleClick += (_, _) => _openSettingsAction();
 
             BuildContextMenu();
 
@@ -40,18 +40,15 @@ namespace FocusGlow.UI
         {
             var menu = new ContextMenuStrip();
 
-            var settingsItem = new ToolStripMenuItem("⚙️ Настройки", null, (s, e) => _openSettingsAction())
-            {
-                Font = new Font(menu.Font, FontStyle.Bold)
-            };
+            var settingsItem = new ToolStripMenuItem("Settings", null, (_, _) => _openSettingsAction());
 
             string hotkeyText = ConfigManager.Current.Hotkey.DisplayText;
-            _toggleMenuItem = new ToolStripMenuItem($"✨ Переключить фокус ({hotkeyText})", null, (s, e) =>
+            _toggleMenuItem = new ToolStripMenuItem($"Enable Focus ({hotkeyText})", null, (_, _) =>
             {
                 _focusManager.ToggleFocus();
             });
 
-            var exitItem = new ToolStripMenuItem("❌ Выход", null, (s, e) =>
+            var exitItem = new ToolStripMenuItem("Exit", null, (_, _) =>
             {
                 System.Windows.Application.Current.Shutdown();
             });
@@ -68,7 +65,9 @@ namespace FocusGlow.UI
         {
             if (_toggleMenuItem != null)
             {
-                _toggleMenuItem.Text = $"✨ Переключить фокус ({config.Hotkey.DisplayText})";
+                _toggleMenuItem.Text = _focusManager.IsFocusActive
+                    ? $"Disable Focus ({config.Hotkey.DisplayText})"
+                    : $"Enable Focus ({config.Hotkey.DisplayText})";
             }
         }
 
@@ -78,32 +77,22 @@ namespace FocusGlow.UI
             {
                 string hotkeyText = ConfigManager.Current.Hotkey.DisplayText;
                 _toggleMenuItem.Text = active
-                    ? $"⏹️ Выключить фокус ({hotkeyText})"
-                    : $"✨ Включить фокус ({hotkeyText})";
+                    ? $"Disable Focus ({hotkeyText})"
+                    : $"Enable Focus ({hotkeyText})";
             }
         }
 
         private static Icon CreateTrayIcon()
         {
-            // Generate a vibrant glowing ring icon matching Apple Intelligence / Gemini colors
             using var bitmap = new Bitmap(32, 32);
             using var g = Graphics.FromImage(bitmap);
             g.SmoothingMode = SmoothingMode.AntiAlias;
 
-            // Outer dark badge
-            using var bgBrush = new SolidBrush(Color.FromArgb(28, 28, 30));
+            using var bgBrush = new SolidBrush(Color.FromArgb(24, 24, 26));
             g.FillEllipse(bgBrush, 2, 2, 28, 28);
 
-            // Radiant gradient ring
-            using var path = new GraphicsPath();
-            path.AddEllipse(5, 5, 22, 22);
-
-            using var pen = new Pen(Color.FromArgb(66, 133, 244), 3.5f);
-            g.DrawPath(pen, path);
-
-            // Gemini magenta/coral accent dot in the center
-            using var dotBrush = new SolidBrush(Color.FromArgb(217, 101, 112));
-            g.FillEllipse(dotBrush, 12, 12, 8, 8);
+            using var ringPen = new Pen(Color.FromArgb(235, 235, 240), 2.2f);
+            g.DrawEllipse(ringPen, 7, 7, 18, 18);
 
             IntPtr hIcon = bitmap.GetHicon();
             return Icon.FromHandle(hIcon);

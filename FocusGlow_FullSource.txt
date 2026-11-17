@@ -1,0 +1,2246 @@
+﻿================================================================================
+FILE: FocusGlow.csproj
+================================================================================
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RollForward>LatestMajor</RollForward>
+    <Nullable>enable</Nullable>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SkiaSharp" Version="2.88.9" />
+    <PackageReference Include="SkiaSharp.Views.WPF" Version="2.88.9" />
+  </ItemGroup>
+
+</Project>
+
+
+================================================================================
+FILE: app.manifest
+================================================================================
+<?xml version="1.0" encoding="utf-8"?>
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity version="1.0.0.0" name="FocusGlow.app"/>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+    <security>
+      <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 and Windows 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+    </application>
+  </compatibility>
+</assembly>
+
+
+================================================================================
+FILE: App.xaml
+================================================================================
+<Application x:Class="FocusGlow.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             ShutdownMode="OnExplicitShutdown">
+    <Application.Resources>
+    </Application.Resources>
+</Application>
+
+
+================================================================================
+FILE: App.xaml.cs
+================================================================================
+using System;
+using System.Threading;
+using System.Windows;
+using System.Windows.Media.Animation;
+using FocusGlow.Core;
+using FocusGlow.Input;
+using FocusGlow.Services;
+using FocusGlow.UI;
+using FocusGlow.Views;
+using Application = System.Windows.Application;
+
+namespace FocusGlow
+{
+    public partial class App : Application
+    {
+        private Mutex? _singleInstanceMutex;
+        private GlobalInputHook? _inputHook;
+        private FocusAnimationController? _animationController;
+        private OverlayWindow? _overlayWindow;
+        private FocusManager? _focusManager;
+        private SettingsWindow? _settingsWindow;
+        private TrayIconManager? _trayIconManager;
+
+        protected override void OnStartup(StartupEventArgs e)
+        {
+            base.OnStartup(e);
+
+            // 1. Single-instance mutex check
+            _singleInstanceMutex = new Mutex(true, "FocusGlow_SingleInstance_Mutex_W11", out bool isNewInstance);
+            if (!isNewInstance)
+            {
+                System.Windows.MessageBox.Show("FocusGlow is already running in the system tray.", "FocusGlow", MessageBoxButton.OK, MessageBoxImage.Information);
+                Shutdown();
+                return;
+            }
+
+            // 2. Unlock high frame rate (up to 240+ Hz monitors)
+            try
+            {
+                Timeline.DesiredFrameRateProperty.OverrideMetadata(typeof(Timeline), new FrameworkPropertyMetadata(240));
+            }
+            catch
+            {
+                // Already overridden or handled
+            }
+
+            // 3. Initialize core services
+            _animationController = new FocusAnimationController();
+            _overlayWindow = new OverlayWindow(_animationController);
+            _focusManager = new FocusManager(_animationController, _overlayWindow);
+
+            // 4. Initialize global input hook (keyboard + mouse XButton1/XButton2)
+            _inputHook = new GlobalInputHook();
+            _inputHook.HotkeyTriggered += () => _focusManager.ToggleFocus();
+            _inputHook.EscapePressed += () =>
+            {
+                if (_focusManager.IsFocusActive)
+                {
+                    _focusManager.DeactivateFocus();
+                }
+            };
+            _inputHook.Install();
+
+            // 5. Initialize settings window
+            _settingsWindow = new SettingsWindow(_focusManager, _inputHook);
+
+            // 6. Initialize system tray icon & menu
+            _trayIconManager = new TrayIconManager(_focusManager, OpenSettings);
+
+            // 7. Show settings window or start in tray
+            var config = ConfigManager.Current;
+            if (!config.StartMinimized)
+            {
+                OpenSettings();
+            }
+        }
+
+        public void OpenSettings()
+        {
+            if (_settingsWindow != null)
+            {
+                _settingsWindow.Show();
+                if (_settingsWindow.WindowState == WindowState.Minimized)
+                {
+                    _settingsWindow.WindowState = WindowState.Normal;
+                }
+                _settingsWindow.Activate();
+            }
+        }
+
+        protected override void OnExit(ExitEventArgs e)
+        {
+            _inputHook?.Dispose();
+            _trayIconManager?.Dispose();
+            _overlayWindow?.Dispose();
+
+            if (_settingsWindow != null)
+            {
+                _settingsWindow.RealClose();
+            }
+
+            if (_singleInstanceMutex != null)
+            {
+                try
+                {
+                    _singleInstanceMutex.ReleaseMutex();
+                }
+                catch { }
+                _singleInstanceMutex.Dispose();
+            }
+
+            base.OnExit(e);
+        }
+    }
+}
+
+
+================================================================================
+FILE: Interop\Win32.cs
+================================================================================
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace FocusGlow.Interop
+{
+    public static class Win32
+    {
+        #region Constants
+
+        public const int GWL_EXSTYLE = -20;
+
+        public const int WS_EX_TOPMOST = 0x00000008;
+        public const int WS_EX_TRANSPARENT = 0x00000020;
+        public const int WS_EX_TOOLWINDOW = 0x00000080;
+        public const int WS_EX_LAYERED = 0x00080000;
+        public const int WS_EX_NOACTIVATE = 0x08000000;
+
+        public const uint SWP_NOSIZE = 0x0001;
+        public const uint SWP_NOMOVE = 0x0002;
+        public const uint SWP_NOZORDER = 0x0004;
+        public const uint SWP_NOACTIVATE = 0x0010;
+        public const uint SWP_SHOWWINDOW = 0x0040;
+
+        public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+
+        public const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+        public const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+        public const int DWMWA_SYSTEMBACKDROP_TYPE = 38;
+
+        public const uint GA_PARENT = 1;
+        public const uint GA_ROOT = 2;
+        public const uint GA_ROOTOWNER = 3;
+
+        public const int SM_XVIRTUALSCREEN = 76;
+        public const int SM_YVIRTUALSCREEN = 77;
+        public const int SM_CXVIRTUALSCREEN = 78;
+        public const int SM_CYVIRTUALSCREEN = 79;
+
+        public const int WH_KEYBOARD_LL = 13;
+        public const int WH_MOUSE_LL = 14;
+
+        public const int WM_KEYDOWN = 0x0100;
+        public const int WM_KEYUP = 0x0101;
+        public const int WM_SYSKEYDOWN = 0x0104;
+        public const int WM_SYSKEYUP = 0x0105;
+
+        public const int WM_XBUTTONDOWN = 0x020B;
+
+        public const int XBUTTON1 = 0x0001;
+        public const int XBUTTON2 = 0x0002;
+
+        public const int VK_SHIFT = 0x10;
+        public const int VK_CONTROL = 0x11;
+        public const int VK_MENU = 0x12;
+        public const int VK_LWIN = 0x5B;
+        public const int VK_RWIN = 0x5C;
+
+        #endregion
+
+        #region Structs
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT
+        {
+            public int X;
+            public int Y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+
+            public bool Contains(int x, int y) =>
+                x >= Left && x <= Right && y >= Top && y <= Bottom;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct KBDLLHOOKSTRUCT
+        {
+            public uint vkCode;
+            public uint scanCode;
+            public uint flags;
+            public uint time;
+            public UIntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MSLLHOOKSTRUCT
+        {
+            public POINT pt;
+            public uint mouseData;
+            public uint flags;
+            public uint time;
+            public UIntPtr dwExtraInfo;
+        }
+
+        #endregion
+
+        public delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        #region P/Invoke APIs
+
+        [DllImport("user32.dll")]
+        public static extern bool GetCursorPos(out POINT lpPoint);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr WindowFromPoint(POINT point);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsZoomed(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsIconic(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern int GetSystemMetrics(int nIndex);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+        [DllImport("dwmapi.dll")]
+        public static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out RECT pvAttribute, int cbAttribute);
+
+        [DllImport("dwmapi.dll")]
+        public static extern int DwmSetWindowAttribute(IntPtr hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        public static extern short GetAsyncKeyState(int vKey);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        public static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        public static extern IntPtr GetModuleHandle(string? lpModuleName);
+
+        [DllImport("user32.dll")]
+        public static extern uint GetDpiForWindow(IntPtr hwnd);
+
+        #endregion
+
+        public static string GetWindowClassName(IntPtr hWnd)
+        {
+            var sb = new StringBuilder(256);
+            GetClassName(hWnd, sb, sb.Capacity);
+            return sb.ToString();
+        }
+
+        public static bool IsDesktopOrTaskbar(IntPtr hWnd)
+        {
+            if (hWnd == IntPtr.Zero) return true;
+            string className = GetWindowClassName(hWnd);
+            return className is "Progman" or "WorkerW" or "Shell_TrayWnd" or "Shell_SecondaryTrayWnd";
+        }
+    }
+}
+
+
+================================================================================
+FILE: Physics\AnimationPhysics.cs
+================================================================================
+using System;
+
+namespace FocusGlow.Physics
+{
+    /// <summary>
+    /// Exact implementation of cubic-bezier curves matching CSS / Apple fluid transitions.
+    /// Uses Newton-Raphson approximation for parameter inversion.
+    /// </summary>
+    public sealed class CubicBezier
+    {
+        private readonly double _x1;
+        private readonly double _y1;
+        private readonly double _x2;
+        private readonly double _y2;
+
+        /// <summary>
+        /// Asymmetric deceleration curve: cubic-bezier(0.22, 1, 0.36, 1) - Apple Intelligence / iOS style.
+        /// </summary>
+        public static readonly CubicBezier AppleDecel = new(0.22, 1.0, 0.36, 1.0);
+
+        /// <summary>
+        /// Standard smooth ease out: cubic-bezier(0.0, 0.0, 0.2, 1.0).
+        /// </summary>
+        public static readonly CubicBezier EaseOut = new(0.0, 0.0, 0.2, 1.0);
+
+        /// <summary>
+        /// Fast out, slow in: cubic-bezier(0.4, 0.0, 0.2, 1.0).
+        /// </summary>
+        public static readonly CubicBezier Standard = new(0.4, 0.0, 0.2, 1.0);
+
+        public CubicBezier(double x1, double y1, double x2, double y2)
+        {
+            _x1 = Math.Clamp(x1, 0.0, 1.0);
+            _y1 = y1;
+            _x2 = Math.Clamp(x2, 0.0, 1.0);
+            _y2 = y2;
+        }
+
+        public double Evaluate(double x)
+        {
+            if (x <= 0.0) return 0.0;
+            if (x >= 1.0) return 1.0;
+
+            double t = SolveT(x);
+            return SampleY(t);
+        }
+
+        public float Evaluate(float x) => (float)Evaluate((double)x);
+
+        private double SampleX(double t)
+        {
+            // B(t) = 3*(1-t)^2 * t * x1 + 3*(1-t) * t^2 * x2 + t^3
+            double oneMinusT = 1.0 - t;
+            return 3.0 * oneMinusT * oneMinusT * t * _x1 +
+                   3.0 * oneMinusT * t * t * _x2 +
+                   t * t * t;
+        }
+
+        private double SampleY(double t)
+        {
+            double oneMinusT = 1.0 - t;
+            return 3.0 * oneMinusT * oneMinusT * t * _y1 +
+                   3.0 * oneMinusT * t * t * _y2 +
+                   t * t * t;
+        }
+
+        private double SampleDerivativeX(double t)
+        {
+            double oneMinusT = 1.0 - t;
+            return 3.0 * oneMinusT * oneMinusT * _x1 +
+                   6.0 * oneMinusT * t * (_x2 - _x1) +
+                   3.0 * t * t * (1.0 - _x2);
+        }
+
+        private double SolveT(double x)
+        {
+            // Initial guess
+            double t = x;
+
+            // 6 iterations of Newton-Raphson
+            for (int i = 0; i < 6; i++)
+            {
+                double currentX = SampleX(t) - x;
+                if (Math.Abs(currentX) < 1e-6)
+                    return t;
+
+                double dX = SampleDerivativeX(t);
+                if (Math.Abs(dX) < 1e-6)
+                    break;
+
+                t -= currentX / dX;
+                t = Math.Clamp(t, 0.0, 1.0);
+            }
+
+            // Fallback bisection if Newton didn't converge tightly
+            double t0 = 0.0;
+            double t1 = 1.0;
+            t = x;
+
+            for (int i = 0; i < 8; i++)
+            {
+                double currentX = SampleX(t);
+                if (Math.Abs(currentX - x) < 1e-5)
+                    return t;
+
+                if (x > currentX)
+                    t0 = t;
+                else
+                    t1 = t;
+
+                t = (t1 + t0) * 0.5;
+            }
+
+            return t;
+        }
+    }
+
+    /// <summary>
+    /// Physics-based damped harmonic oscillator (damped spring).
+    /// Seamlessly continues from current value and velocity when interrupted.
+    /// </summary>
+    public sealed class DampedSpring
+    {
+        public double Value { get; set; }
+        public double Velocity { get; set; }
+        public double Target { get; set; }
+
+        /// <summary>
+        /// Natural angular frequency (stiffness). Default = 28.0 (fast responsive spring).
+        /// </summary>
+        public double Frequency { get; set; }
+
+        /// <summary>
+        /// Damping ratio (zeta).
+        /// 1.0 = critically damped (no overshoot, fastest settling).
+        /// &gt; 1.0 = overdamped.
+        /// &lt; 1.0 = underdamped (bouncy).
+        /// Default = 1.0.
+        /// </summary>
+        public double DampingRatio { get; set; }
+
+        public DampedSpring(double initialValue = 0.0, double frequency = 28.0, double dampingRatio = 1.0)
+        {
+            Value = initialValue;
+            Target = initialValue;
+            Velocity = 0.0;
+            Frequency = frequency;
+            DampingRatio = dampingRatio;
+        }
+
+        public void Reset(double value)
+        {
+            Value = value;
+            Target = value;
+            Velocity = 0.0;
+        }
+
+        public void Update(double dt)
+        {
+            if (dt <= 0.0) return;
+            // Clamp dt to avoid instability on huge frame drops
+            if (dt > 0.05) dt = 0.05;
+
+            // Semi-implicit Euler integration for second-order spring:
+            // a = -omega^2 * (x - target) - 2 * zeta * omega * v
+            double displacement = Value - Target;
+            double omega = Frequency;
+            double springForce = -(omega * omega) * displacement;
+            double dampingForce = -(2.0 * DampingRatio * omega) * Velocity;
+            double acceleration = springForce + dampingForce;
+
+            Velocity += acceleration * dt;
+            Value += Velocity * dt;
+
+            // Snap when effectively settled
+            if (Math.Abs(displacement) < 1e-4 && Math.Abs(Velocity) < 1e-3)
+            {
+                Value = Target;
+                Velocity = 0.0;
+            }
+        }
+
+        public bool IsSettled => Math.Abs(Value - Target) < 1e-4 && Math.Abs(Velocity) < 1e-3;
+    }
+
+    /// <summary>
+    /// Smooth damp helper for float values.
+    /// </summary>
+    public static class SmoothDamp
+    {
+        public static float Update(float current, float target, ref float currentVelocity, float smoothTime, float maxSpeed, float deltaTime)
+        {
+            smoothTime = Math.Max(0.0001f, smoothTime);
+            float omega = 2f / smoothTime;
+
+            float x = omega * deltaTime;
+            float exp = 1f / (1f + x + 0.48f * x * x + 0.235f * x * x * x);
+            float change = current - target;
+            float originalTo = target;
+
+            float maxChange = maxSpeed * smoothTime;
+            change = Math.Clamp(change, -maxChange, maxChange);
+            target = current - change;
+
+            float temp = (currentVelocity + omega * change) * deltaTime;
+            currentVelocity = (currentVelocity - omega * temp) * exp;
+            float output = target + (change + temp) * exp;
+
+            if (originalTo - current > 0.0f == output > originalTo)
+            {
+                output = originalTo;
+                currentVelocity = (output - originalTo) / deltaTime;
+            }
+
+            return output;
+        }
+    }
+}
+
+
+================================================================================
+FILE: Models\AppConfig.cs
+================================================================================
+using System;
+using System.Text.Json.Serialization;
+
+namespace FocusGlow.Models
+{
+    [Flags]
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public enum HotkeyModifiers
+    {
+        None = 0,
+        Alt = 1,
+        Control = 2,
+        Shift = 4,
+        Windows = 8
+    }
+
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public enum MouseSideButton
+    {
+        None = 0,
+        XButton1 = 1, // Back button
+        XButton2 = 2  // Forward button
+    }
+
+    public sealed class HotkeyBinding
+    {
+        public HotkeyModifiers Modifiers { get; set; } = HotkeyModifiers.Alt;
+        public string Key { get; set; } = "F";
+        public MouseSideButton MouseButton { get; set; } = MouseSideButton.None;
+
+        public bool IsMouseButton => MouseButton != MouseSideButton.None;
+
+        public string DisplayText
+        {
+            get
+            {
+                var parts = new System.Collections.Generic.List<string>();
+                if (Modifiers.HasFlag(HotkeyModifiers.Control)) parts.Add("Ctrl");
+                if (Modifiers.HasFlag(HotkeyModifiers.Alt)) parts.Add("Alt");
+                if (Modifiers.HasFlag(HotkeyModifiers.Shift)) parts.Add("Shift");
+                if (Modifiers.HasFlag(HotkeyModifiers.Windows)) parts.Add("Win");
+
+                if (IsMouseButton)
+                {
+                    parts.Add(MouseButton switch
+                    {
+                        MouseSideButton.XButton1 => "Mouse 4 (XButton1)",
+                        MouseSideButton.XButton2 => "Mouse 5 (XButton2)",
+                        _ => MouseButton.ToString()
+                    });
+                }
+                else
+                {
+                    parts.Add(string.IsNullOrWhiteSpace(Key) ? "None" : Key);
+                }
+
+                return string.Join(" + ", parts);
+            }
+        }
+    }
+
+    public sealed class AppConfig
+    {
+        public HotkeyBinding Hotkey { get; set; } = new HotkeyBinding();
+
+        /// <summary>
+        /// Base corner radius for normal windows in DIP (Win11 default is 8).
+        /// </summary>
+        public float CornerRadius { get; set; } = 8f;
+
+        /// <summary>
+        /// Duration of Phase 1 glow comet in milliseconds.
+        /// </summary>
+        public double GlowDurationMs { get; set; } = 1000.0;
+
+        /// <summary>
+        /// Duration of Stage 2A fast dimming (0% to 50%) in milliseconds.
+        /// </summary>
+        public double FastDimDurationMs { get; set; } = 450.0;
+
+        /// <summary>
+        /// Duration of Stage 2B slow dimming (50% to 100%) in milliseconds.
+        /// </summary>
+        public double DeepDimDurationMs { get; set; } = 1500.0;
+
+        /// <summary>
+        /// Duration of cursor exit dimming fadeout (current to 0%) in milliseconds.
+        /// </summary>
+        public double CursorExitDurationMs { get; set; } = 220.0;
+
+        /// <summary>
+        /// Multiplier for overall dimming speed (default 1.0).
+        /// </summary>
+        public double DimSpeedMultiplier { get; set; } = 1.0;
+
+        /// <summary>
+        /// Whether closing or minimizing the settings window hides it to system tray.
+        /// </summary>
+        public bool MinimizeToTray { get; set; } = true;
+
+        /// <summary>
+        /// Start minimized to system tray.
+        /// </summary>
+        public bool StartMinimized { get; set; } = false;
+    }
+}
+
+
+================================================================================
+FILE: Services\ConfigManager.cs
+================================================================================
+using System;
+using System.IO;
+using System.Text.Json;
+using FocusGlow.Models;
+
+namespace FocusGlow.Services
+{
+    public sealed class ConfigManager
+    {
+        private static readonly JsonSerializerOptions JsonOptions = new()
+        {
+            WriteIndented = true,
+            PropertyNameCaseInsensitive = true
+        };
+
+        private static readonly string ConfigPath = Path.Combine(
+            AppDomain.CurrentDomain.BaseDirectory,
+            "config.json"
+        );
+
+        private static readonly object LockObj = new();
+        private static AppConfig? _current;
+
+        public static event Action<AppConfig>? ConfigChanged;
+
+        public static AppConfig Current
+        {
+            get
+            {
+                if (_current == null)
+                {
+                    lock (LockObj)
+                    {
+                        _current ??= LoadInternal();
+                    }
+                }
+                return _current;
+            }
+        }
+
+        private static AppConfig LoadInternal()
+        {
+            try
+            {
+                if (File.Exists(ConfigPath))
+                {
+                    string json = File.ReadAllText(ConfigPath);
+                    var config = JsonSerializer.Deserialize<AppConfig>(json, JsonOptions);
+                    if (config != null)
+                        return config;
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Failed to load config: {ex.Message}");
+            }
+
+            var defaultConfig = new AppConfig();
+            Save(defaultConfig);
+            return defaultConfig;
+        }
+
+        public static void Save(AppConfig config)
+        {
+            lock (LockObj)
+            {
+                _current = config;
+                try
+                {
+                    string json = JsonSerializer.Serialize(config, JsonOptions);
+                    File.WriteAllText(ConfigPath, json);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"Failed to save config: {ex.Message}");
+                }
+            }
+
+            ConfigChanged?.Invoke(config);
+        }
+
+        public static void Update(Action<AppConfig> updater)
+        {
+            var config = Current;
+            updater(config);
+            Save(config);
+        }
+    }
+}
+
+
+================================================================================
+FILE: Rendering\FocusOverlayRenderer.cs
+================================================================================
+using System;
+using FocusGlow.Physics;
+using SkiaSharp;
+
+namespace FocusGlow.Rendering
+{
+    public sealed class FocusOverlayRenderer : IDisposable
+    {
+        // Направленный оптический блик: 65% периметра остаются тёмными,
+        // ядро — чистый жемчужно-белый свет, по краям — деликатная хроматическая дисперсия.
+        private static readonly SKColor[] OpticalColors =
+        {
+            new(255, 255, 255, 0),
+            new(255, 255, 255, 0),
+            new(168, 199, 250, 48),   // Лёгкий ледяной оттенок в хвосте
+            new(203, 184, 248, 135),  // Мягкая лавандовая дисперсия
+            new(255, 255, 255, 255),  // Чистое белое ядро блика
+            new(245, 224, 198, 165),  // Тёплый перламутровый фронт
+            new(168, 199, 250, 40),   // Мягкое затухание впереди
+            new(255, 255, 255, 0),
+            new(255, 255, 255, 0)
+        };
+
+        private static readonly float[] OpticalPositions =
+        {
+            0.00f,
+            0.22f,
+            0.31f,
+            0.39f,
+            0.46f,
+            0.52f,
+            0.58f,
+            0.66f,
+            1.00f
+        };
+
+        private readonly SKPaint _dimPaint;
+        private readonly SKPaint _ambientHaloPaint;
+        private readonly SKPaint _opticalBloomPaint;
+        private readonly SKPaint _specularHairlinePaint;
+
+        private readonly SKMaskFilter _ambientBlurFilter;
+        private readonly SKMaskFilter _bloomBlurFilter;
+        private readonly SKPath _contourPath = new();
+
+        public FocusOverlayRenderer()
+        {
+            _dimPaint = new SKPaint
+            {
+                Color = SKColors.Black,
+                Style = SKPaintStyle.Fill,
+                IsAntialias = true
+            };
+
+            _ambientBlurFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, 10f);
+            _bloomBlurFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, 2.8f);
+
+            // Слой 3: еле уловимый атмосферный отсвет (пик ~12%)
+            _ambientHaloPaint = new SKPaint
+            {
+                Style = SKPaintStyle.Stroke,
+                StrokeWidth = 11f,
+                IsAntialias = true,
+                MaskFilter = _ambientBlurFilter
+            };
+
+            // Слой 2: узкое оптическое рассеивание вдоль грани (пик ~38%)
+            _opticalBloomPaint = new SKPaint
+            {
+                Style = SKPaintStyle.Stroke,
+                StrokeWidth = 3.5f,
+                IsAntialias = true,
+                MaskFilter = _bloomBlurFilter
+            };
+
+            // Слой 1: острая как бритва световая нить строго по геометрии окна
+            _specularHairlinePaint = new SKPaint
+            {
+                Style = SKPaintStyle.Stroke,
+                StrokeWidth = 1.25f,
+                IsAntialias = true
+            };
+        }
+
+        public void Render(
+            SKCanvas canvas,
+            int canvasWidth,
+            int canvasHeight,
+            SKRoundRect targetWindowRect,
+            float dimOpacity,
+            float glowAlpha,
+            float glowProgress)
+        {
+            canvas.Clear(SKColors.Transparent);
+
+            // Затемнение всего пространства вокруг активного окна
+            if (dimOpacity > 0.001f)
+            {
+                canvas.Save();
+                canvas.ClipRoundRect(targetWindowRect, SKClipOperation.Difference, antialias: true);
+
+                byte alphaByte = (byte)Math.Clamp((int)(dimOpacity * 255f), 0, 255);
+                _dimPaint.Color = new SKColor(0, 0, 0, alphaByte);
+                canvas.DrawRect(0, 0, canvasWidth, canvasHeight, _dimPaint);
+                canvas.Restore();
+            }
+
+            // Оптический световой импульс по грани окна
+            if (glowAlpha > 0.001f && targetWindowRect.Width > 10 && targetWindowRect.Height > 10)
+            {
+                DrawOpticalSweep(canvas, targetWindowRect, glowAlpha, glowProgress);
+            }
+        }
+
+        private void DrawOpticalSweep(
+            SKCanvas canvas,
+            SKRoundRect targetRect,
+            float glowAlpha,
+            float glowProgress)
+        {
+            _contourPath.Rewind();
+            _contourPath.AddRoundRect(targetRect, SKPathDirection.Clockwise);
+
+            // Асимметричное замедление в духе macOS / Apple Intelligence
+            float easedProgress = CubicBezier.AppleDecel.Evaluate(glowProgress);
+            float rotationAngle = -55f + easedProgress * 360f;
+
+            var center = new SKPoint(targetRect.Rect.MidX, targetRect.Rect.MidY);
+            var matrix = SKMatrix.CreateRotationDegrees(rotationAngle, center.X, center.Y);
+
+            using var shader = SKShader.CreateSweepGradient(center, OpticalColors, OpticalPositions, matrix);
+
+            _ambientHaloPaint.Shader = shader;
+            _ambientHaloPaint.Color = new SKColor(255, 255, 255, (byte)Math.Clamp((int)(0.13f * glowAlpha * 255f), 0, 255));
+            canvas.DrawPath(_contourPath, _ambientHaloPaint);
+
+            _opticalBloomPaint.Shader = shader;
+            _opticalBloomPaint.Color = new SKColor(255, 255, 255, (byte)Math.Clamp((int)(0.38f * glowAlpha * 255f), 0, 255));
+            canvas.DrawPath(_contourPath, _opticalBloomPaint);
+
+            _specularHairlinePaint.Shader = shader;
+            _specularHairlinePaint.Color = new SKColor(255, 255, 255, (byte)Math.Clamp((int)(0.92f * glowAlpha * 255f), 0, 255));
+            canvas.DrawPath(_contourPath, _specularHairlinePaint);
+
+            _ambientHaloPaint.Shader = null;
+            _opticalBloomPaint.Shader = null;
+            _specularHairlinePaint.Shader = null;
+        }
+
+        public void Dispose()
+        {
+            _contourPath.Dispose();
+            _dimPaint.Dispose();
+            _ambientHaloPaint.Dispose();
+            _opticalBloomPaint.Dispose();
+            _specularHairlinePaint.Dispose();
+            _ambientBlurFilter.Dispose();
+            _bloomBlurFilter.Dispose();
+        }
+    }
+}
+
+
+================================================================================
+FILE: Core\FocusAnimationController.cs
+================================================================================
+using System;
+using System.Runtime.InteropServices;
+using FocusGlow.Interop;
+using FocusGlow.Physics;
+using FocusGlow.Services;
+using SkiaSharp;
+
+namespace FocusGlow.Core
+{
+    public enum FocusState
+    {
+        Inactive,
+        Activating,
+        Active,
+        Deactivating
+    }
+
+    public sealed class FocusAnimationController
+    {
+        public FocusState State { get; private set; } = FocusState.Inactive;
+        public IntPtr TargetHwnd { get; private set; } = IntPtr.Zero;
+        public SKRoundRect CurrentTargetRoundRect { get; private set; } = new();
+
+        public float CurrentDimOpacity { get; private set; }
+        public float CurrentGlowAlpha { get; private set; }
+        public float CurrentGlowProgress { get; private set; }
+        public bool IsCursorInsideTarget { get; private set; } = true;
+
+        public event Action? DeactivationCompleted;
+
+        private double _glowTimer;
+        private double _glowDuration = 0.85;
+
+        private float _dimFromOpacity;
+        private float _dimTargetOpacity;
+        private double _dimTimer;
+        private double _dimDuration = 0.45;
+        private bool _isTwoStageDimming;
+        private int _currentDimStage = 1;
+
+        private float _cursorExitFromOpacity;
+        private double _cursorExitTimer;
+        private double _cursorExitDuration = 0.22;
+
+        private float _deactFromOpacity;
+        private double _deactTimer;
+        private double _deactDuration = 0.20;
+
+        private float _smoothedLeft;
+        private float _smoothedTop;
+        private float _smoothedRight;
+        private float _smoothedBottom;
+        private float _smoothedRadius;
+        private float _velLeft, _velTop, _velRight, _velBottom, _velRadius;
+
+        public void Activate(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero || !Win32.IsWindow(hwnd))
+                return;
+
+            TargetHwnd = hwnd;
+            State = FocusState.Activating;
+            IsCursorInsideTarget = true;
+
+            var config = ConfigManager.Current;
+            _glowDuration = Math.Clamp(config.GlowDurationMs / 1000.0, 0.4, 1.5);
+            if (Math.Abs(config.GlowDurationMs - 1000.0) < 1.0)
+                _glowDuration = 0.85; // более собранный, быстрый импульс по умолчанию
+
+            _glowTimer = 0.0;
+            CurrentGlowAlpha = 0.0f;
+            CurrentGlowProgress = 0.0f;
+
+            UpdateWindowCoordinates(instantSnap: true, dt: 0.016);
+
+            CurrentDimOpacity = 0.0f;
+            StartDimmingSequence(fromOpacity: 0.0f);
+        }
+
+        public void Deactivate()
+        {
+            if (State is FocusState.Inactive or FocusState.Deactivating)
+                return;
+
+            State = FocusState.Deactivating;
+            _deactFromOpacity = CurrentDimOpacity;
+            _deactTimer = 0.0;
+            _deactDuration = Math.Max(0.05, ConfigManager.Current.CursorExitDurationMs / 1000.0);
+        }
+
+        private void StartDimmingSequence(float fromOpacity)
+        {
+            var config = ConfigManager.Current;
+            double speedMult = Math.Max(0.1, config.DimSpeedMultiplier);
+            double baseFast = (config.FastDimDurationMs / 1000.0) / speedMult;
+            double baseDeep = (config.DeepDimDurationMs / 1000.0) / speedMult;
+
+            _dimFromOpacity = fromOpacity;
+            _dimTimer = 0.0;
+            _isTwoStageDimming = true;
+
+            if (fromOpacity < 0.5f)
+            {
+                _currentDimStage = 1;
+                _dimTargetOpacity = 0.5f;
+                float fraction = (0.5f - fromOpacity) / 0.5f;
+                _dimDuration = Math.Max(0.05, baseFast * fraction);
+            }
+            else
+            {
+                _currentDimStage = 2;
+                _dimTargetOpacity = 1.0f;
+                float fraction = (1.0f - fromOpacity) / 0.5f;
+                _dimDuration = Math.Max(0.05, baseDeep * fraction);
+            }
+        }
+
+        public void Update(double dt)
+        {
+            if (State == FocusState.Inactive)
+                return;
+
+            if (!Win32.IsWindow(TargetHwnd) || !Win32.IsWindowVisible(TargetHwnd) || Win32.IsIconic(TargetHwnd))
+            {
+                Deactivate();
+            }
+
+            UpdateWindowCoordinates(instantSnap: false, dt: dt);
+            UpdateGlowPhase(dt);
+            UpdateCursorReaction(dt);
+
+            if (State == FocusState.Deactivating)
+            {
+                _deactTimer += dt;
+                float t = Math.Clamp((float)(_deactTimer / _deactDuration), 0f, 1f);
+                float eased = CubicBezier.AppleDecel.Evaluate(t);
+                CurrentDimOpacity = Math.Clamp(_deactFromOpacity * (1.0f - eased), 0f, 1f);
+                CurrentGlowAlpha = Math.Clamp(CurrentGlowAlpha * (1.0f - eased), 0f, 1f);
+
+                if (t >= 1.0f && CurrentDimOpacity <= 0.001f && CurrentGlowAlpha <= 0.001f)
+                {
+                    CurrentDimOpacity = 0.0f;
+                    CurrentGlowAlpha = 0.0f;
+                    State = FocusState.Inactive;
+                    TargetHwnd = IntPtr.Zero;
+                    DeactivationCompleted?.Invoke();
+                }
+            }
+        }
+
+        private void UpdateGlowPhase(double dt)
+        {
+            if (_glowTimer < _glowDuration)
+            {
+                _glowTimer += dt;
+                float p = Math.Clamp((float)(_glowTimer / _glowDuration), 0f, 1f);
+                CurrentGlowProgress = p;
+
+                // Мягкое появление за 12%, удержание до 52%, затем полное растворение к концу первой фазы затемнения
+                if (p < 0.12f)
+                {
+                    CurrentGlowAlpha = CubicBezier.EaseOut.Evaluate(p / 0.12f);
+                }
+                else if (p <= 0.52f)
+                {
+                    CurrentGlowAlpha = 1.0f;
+                }
+                else
+                {
+                    float dissolveT = (p - 0.52f) / 0.48f;
+                    CurrentGlowAlpha = 1.0f - CubicBezier.AppleDecel.Evaluate(dissolveT);
+                }
+            }
+            else
+            {
+                CurrentGlowAlpha = 0.0f;
+                if (State == FocusState.Activating)
+                {
+                    State = FocusState.Active;
+                }
+            }
+        }
+
+        private void UpdateCursorReaction(double dt)
+        {
+            if (State == FocusState.Deactivating)
+                return;
+
+            Win32.GetCursorPos(out Win32.POINT cursorPt);
+
+            int hr = Win32.DwmGetWindowAttribute(TargetHwnd, Win32.DWMWA_EXTENDED_FRAME_BOUNDS, out Win32.RECT winRect, Marshal.SizeOf<Win32.RECT>());
+            bool inside = hr == 0 && winRect.Contains(cursorPt.X, cursorPt.Y);
+
+            var config = ConfigManager.Current;
+            double exitDuration = Math.Max(0.05, config.CursorExitDurationMs / 1000.0);
+
+            if (inside != IsCursorInsideTarget)
+            {
+                IsCursorInsideTarget = inside;
+
+                if (!inside)
+                {
+                    _cursorExitFromOpacity = CurrentDimOpacity;
+                    _cursorExitTimer = 0.0;
+                    _cursorExitDuration = exitDuration;
+                    _isTwoStageDimming = false;
+                }
+                else
+                {
+                    StartDimmingSequence(fromOpacity: CurrentDimOpacity);
+                }
+            }
+
+            if (!IsCursorInsideTarget)
+            {
+                _cursorExitTimer += dt;
+                float t = Math.Clamp((float)(_cursorExitTimer / _cursorExitDuration), 0f, 1f);
+                float eased = CubicBezier.AppleDecel.Evaluate(t);
+                CurrentDimOpacity = Math.Clamp(_cursorExitFromOpacity * (1.0f - eased), 0f, 1f);
+            }
+            else if (_isTwoStageDimming)
+            {
+                _dimTimer += dt;
+                float t = Math.Clamp((float)(_dimTimer / _dimDuration), 0f, 1f);
+                float eased = CubicBezier.AppleDecel.Evaluate(t);
+
+                CurrentDimOpacity = Math.Clamp(_dimFromOpacity + (_dimTargetOpacity - _dimFromOpacity) * eased, 0f, 1f);
+
+                if (t >= 1.0f)
+                {
+                    if (_currentDimStage == 1)
+                    {
+                        _currentDimStage = 2;
+                        _dimFromOpacity = 0.5f;
+                        _dimTargetOpacity = 1.0f;
+                        _dimTimer = 0.0;
+                        double speedMult = Math.Max(0.1, config.DimSpeedMultiplier);
+                        _dimDuration = Math.Max(0.1, (config.DeepDimDurationMs / 1000.0) / speedMult);
+                    }
+                    else
+                    {
+                        CurrentDimOpacity = 1.0f;
+                        _isTwoStageDimming = false;
+                    }
+                }
+            }
+        }
+
+        private void UpdateWindowCoordinates(bool instantSnap, double dt)
+        {
+            if (TargetHwnd == IntPtr.Zero) return;
+
+            int hr = Win32.DwmGetWindowAttribute(TargetHwnd, Win32.DWMWA_EXTENDED_FRAME_BOUNDS, out Win32.RECT winRect, Marshal.SizeOf<Win32.RECT>());
+            if (hr != 0) return;
+
+            int vx = Win32.GetSystemMetrics(Win32.SM_XVIRTUALSCREEN);
+            int vy = Win32.GetSystemMetrics(Win32.SM_YVIRTUALSCREEN);
+
+            float localLeft = winRect.Left - vx;
+            float localTop = winRect.Top - vy;
+            float localRight = winRect.Right - vx;
+            float localBottom = winRect.Bottom - vy;
+
+            bool isZoomed = Win32.IsZoomed(TargetHwnd);
+            float targetRadius = 0f;
+            if (!isZoomed)
+            {
+                // Компенсация 1px DWM-асимметрии Windows 11:
+                // DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) на Win11
+                // захватывает лишний 1px с левого, верхнего и нижнего краёв.
+                localLeft += 1f;
+                localTop += 1f;
+                localBottom -= 1f;
+
+                uint dpi = Win32.GetDpiForWindow(TargetHwnd);
+                if (dpi == 0) dpi = 96;
+                targetRadius = ConfigManager.Current.CornerRadius * (dpi / 96f);
+            }
+
+            if (instantSnap)
+            {
+                _smoothedLeft = localLeft;
+                _smoothedTop = localTop;
+                _smoothedRight = localRight;
+                _smoothedBottom = localBottom;
+                _smoothedRadius = targetRadius;
+                _velLeft = _velTop = _velRight = _velBottom = _velRadius = 0f;
+            }
+            else
+            {
+                const float smoothTime = 0.025f;
+                const float maxSpeed = 12000f;
+                float fdt = (float)Math.Clamp(dt, 0.001, 0.05);
+
+                _smoothedLeft = SmoothDamp.Update(_smoothedLeft, localLeft, ref _velLeft, smoothTime, maxSpeed, fdt);
+                _smoothedTop = SmoothDamp.Update(_smoothedTop, localTop, ref _velTop, smoothTime, maxSpeed, fdt);
+                _smoothedRight = SmoothDamp.Update(_smoothedRight, localRight, ref _velRight, smoothTime, maxSpeed, fdt);
+                _smoothedBottom = SmoothDamp.Update(_smoothedBottom, localBottom, ref _velBottom, smoothTime, maxSpeed, fdt);
+                _smoothedRadius = SmoothDamp.Update(_smoothedRadius, targetRadius, ref _velRadius, smoothTime, maxSpeed, fdt);
+
+                // Мгновенная фиксация к целым пикселям в покое для исключения субпиксельного размытия сглаживания
+                if (Math.Abs(_smoothedLeft - localLeft) < 0.25f) _smoothedLeft = localLeft;
+                if (Math.Abs(_smoothedTop - localTop) < 0.25f) _smoothedTop = localTop;
+                if (Math.Abs(_smoothedRight - localRight) < 0.25f) _smoothedRight = localRight;
+                if (Math.Abs(_smoothedBottom - localBottom) < 0.25f) _smoothedBottom = localBottom;
+                if (Math.Abs(_smoothedRadius - targetRadius) < 0.1f) _smoothedRadius = targetRadius;
+            }
+
+            CurrentTargetRoundRect = new SKRoundRect(
+                new SKRect(_smoothedLeft, _smoothedTop, _smoothedRight, _smoothedBottom),
+                _smoothedRadius,
+                _smoothedRadius);
+        }
+    }
+}
+
+
+================================================================================
+FILE: Core\FocusManager.cs
+================================================================================
+using System;
+using FocusGlow.Interop;
+using FocusGlow.Views;
+using Application = System.Windows.Application;
+
+namespace FocusGlow.Core
+{
+    public sealed class FocusManager
+    {
+        private readonly FocusAnimationController _controller;
+        private readonly OverlayWindow _overlayWindow;
+
+        public bool IsFocusActive => _controller.State is FocusState.Activating or FocusState.Active;
+
+        public event Action<bool>? FocusStateChanged;
+
+        public FocusManager(FocusAnimationController controller, OverlayWindow overlayWindow)
+        {
+            _controller = controller;
+            _overlayWindow = overlayWindow;
+            _controller.DeactivationCompleted += OnDeactivationCompleted;
+        }
+
+        public void ToggleFocus()
+        {
+            if (IsFocusActive)
+                DeactivateFocus();
+            else
+                ActivateFocusUnderCursor();
+        }
+
+        public void ActivateFocusUnderCursor()
+        {
+            IntPtr targetHwnd = FindTopLevelWindowUnderCursor();
+            if (targetHwnd == IntPtr.Zero)
+                return;
+
+            ActivateFocus(targetHwnd);
+        }
+
+        public void ActivateFocus(IntPtr targetHwnd)
+        {
+            if (targetHwnd == IntPtr.Zero || !Win32.IsWindow(targetHwnd))
+                return;
+
+            Application.Current.Dispatcher.BeginInvoke(() =>
+            {
+                _overlayWindow.ActivateOverlay(targetHwnd);
+                FocusStateChanged?.Invoke(true);
+            });
+        }
+
+        public void DeactivateFocus()
+        {
+            if (!IsFocusActive) return;
+
+            Application.Current.Dispatcher.BeginInvoke(() =>
+            {
+                _controller.Deactivate();
+            });
+        }
+
+        private void OnDeactivationCompleted()
+        {
+            Application.Current.Dispatcher.BeginInvoke(() =>
+            {
+                _overlayWindow.DeactivateOverlay();
+                FocusStateChanged?.Invoke(false);
+            });
+        }
+
+        public static IntPtr FindTopLevelWindowUnderCursor()
+        {
+            if (!Win32.GetCursorPos(out Win32.POINT cursorPt))
+                return IntPtr.Zero;
+
+            IntPtr pointHwnd = Win32.WindowFromPoint(cursorPt);
+            if (pointHwnd == IntPtr.Zero)
+                return IntPtr.Zero;
+
+            IntPtr rootHwnd = Win32.GetAncestor(pointHwnd, Win32.GA_ROOT);
+            if (rootHwnd == IntPtr.Zero)
+                rootHwnd = pointHwnd;
+
+            if (!Win32.IsWindowVisible(rootHwnd) || Win32.IsDesktopOrTaskbar(rootHwnd))
+                return IntPtr.Zero;
+
+            return rootHwnd;
+        }
+    }
+}
+
+
+================================================================================
+FILE: Input\GlobalInputHook.cs
+================================================================================
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+using FocusGlow.Interop;
+using FocusGlow.Models;
+using FocusGlow.Services;
+
+namespace FocusGlow.Input
+{
+    public sealed class GlobalInputHook : IDisposable
+    {
+        private Win32.HookProc? _keyboardProc;
+        private Win32.HookProc? _mouseProc;
+
+        private IntPtr _keyboardHookId = IntPtr.Zero;
+        private IntPtr _mouseHookId = IntPtr.Zero;
+
+        public event Action? HotkeyTriggered;
+        public event Action? EscapePressed;
+
+        public bool IsRecording { get; private set; }
+        private Action<HotkeyBinding>? _onHotkeyRecorded;
+
+        public bool IsActive => _keyboardHookId != IntPtr.Zero;
+
+        public void Install()
+        {
+            if (IsActive) return;
+
+            _keyboardProc = KeyboardHookCallback;
+            _mouseProc = MouseHookCallback;
+
+            using var curProcess = Process.GetCurrentProcess();
+            using var curModule = curProcess.MainModule;
+            IntPtr moduleHandle = Win32.GetModuleHandle(curModule?.ModuleName);
+
+            _keyboardHookId = Win32.SetWindowsHookEx(Win32.WH_KEYBOARD_LL, _keyboardProc, moduleHandle, 0);
+            _mouseHookId = Win32.SetWindowsHookEx(Win32.WH_MOUSE_LL, _mouseProc, moduleHandle, 0);
+        }
+
+        public void Uninstall()
+        {
+            if (_keyboardHookId != IntPtr.Zero)
+            {
+                Win32.UnhookWindowsHookEx(_keyboardHookId);
+                _keyboardHookId = IntPtr.Zero;
+            }
+
+            if (_mouseHookId != IntPtr.Zero)
+            {
+                Win32.UnhookWindowsHookEx(_mouseHookId);
+                _mouseHookId = IntPtr.Zero;
+            }
+        }
+
+        public void StartRecording(Action<HotkeyBinding> onRecorded)
+        {
+            _onHotkeyRecorded = onRecorded;
+            IsRecording = true;
+        }
+
+        public void CancelRecording()
+        {
+            IsRecording = false;
+            _onHotkeyRecorded = null;
+        }
+
+        private IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0)
+            {
+                int message = wParam.ToInt32();
+                if (message is Win32.WM_KEYDOWN or Win32.WM_SYSKEYDOWN)
+                {
+                    var kbd = Marshal.PtrToStructure<Win32.KBDLLHOOKSTRUCT>(lParam);
+                    var key = (Keys)kbd.vkCode;
+
+                    // Check for Escape to cancel recording or deactivate focus
+                    if (key == Keys.Escape)
+                    {
+                        if (IsRecording)
+                        {
+                            CancelRecording();
+                            return (IntPtr)1; // swallow escape
+                        }
+
+                        EscapePressed?.Invoke();
+                    }
+                    else
+                    {
+                        var modifiers = GetCurrentModifiers();
+
+                        if (IsRecording)
+                        {
+                            // Skip standalone modifier key presses during recording
+                            if (key is not (Keys.ControlKey or Keys.LControlKey or Keys.RControlKey or
+                                            Keys.Menu or Keys.LMenu or Keys.RMenu or
+                                            Keys.ShiftKey or Keys.LShiftKey or Keys.RShiftKey or
+                                            Keys.LWin or Keys.RWin))
+                            {
+                                var binding = new HotkeyBinding
+                                {
+                                    Modifiers = modifiers,
+                                    Key = key.ToString(),
+                                    MouseButton = MouseSideButton.None
+                                };
+
+                                IsRecording = false;
+                                var cb = _onHotkeyRecorded;
+                                _onHotkeyRecorded = null;
+                                cb?.Invoke(binding);
+
+                                return (IntPtr)1; // swallow recorded key
+                            }
+                        }
+                        else
+                        {
+                            // Match configured hotkey
+                            var binding = ConfigManager.Current.Hotkey;
+                            if (!binding.IsMouseButton &&
+                                string.Equals(binding.Key, key.ToString(), StringComparison.OrdinalIgnoreCase) &&
+                                binding.Modifiers == modifiers)
+                            {
+                                HotkeyTriggered?.Invoke();
+                                return (IntPtr)1; // swallow hotkey
+                            }
+                        }
+                    }
+                }
+            }
+
+            return Win32.CallNextHookEx(_keyboardHookId, nCode, wParam, lParam);
+        }
+
+        private IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0)
+            {
+                int message = wParam.ToInt32();
+                if (message == Win32.WM_XBUTTONDOWN)
+                {
+                    var ms = Marshal.PtrToStructure<Win32.MSLLHOOKSTRUCT>(lParam);
+                    int xButton = (int)((ms.mouseData >> 16) & 0xFFFF);
+
+                    var sideButton = xButton switch
+                    {
+                        Win32.XBUTTON1 => MouseSideButton.XButton1,
+                        Win32.XBUTTON2 => MouseSideButton.XButton2,
+                        _ => MouseSideButton.None
+                    };
+
+                    if (sideButton != MouseSideButton.None)
+                    {
+                        var modifiers = GetCurrentModifiers();
+
+                        if (IsRecording)
+                        {
+                            var binding = new HotkeyBinding
+                            {
+                                Modifiers = modifiers,
+                                Key = string.Empty,
+                                MouseButton = sideButton
+                            };
+
+                            IsRecording = false;
+                            var cb = _onHotkeyRecorded;
+                            _onHotkeyRecorded = null;
+                            cb?.Invoke(binding);
+
+                            return (IntPtr)1; // swallow side button
+                        }
+
+                        var currentBinding = ConfigManager.Current.Hotkey;
+                        if (currentBinding.IsMouseButton &&
+                            currentBinding.MouseButton == sideButton &&
+                            currentBinding.Modifiers == modifiers)
+                        {
+                            HotkeyTriggered?.Invoke();
+                            return (IntPtr)1; // swallow side button
+                        }
+                    }
+                }
+            }
+
+            return Win32.CallNextHookEx(_mouseHookId, nCode, wParam, lParam);
+        }
+
+        private static HotkeyModifiers GetCurrentModifiers()
+        {
+            var modifiers = HotkeyModifiers.None;
+
+            if ((Win32.GetAsyncKeyState(Win32.VK_CONTROL) & 0x8000) != 0)
+                modifiers |= HotkeyModifiers.Control;
+
+            if ((Win32.GetAsyncKeyState(Win32.VK_MENU) & 0x8000) != 0)
+                modifiers |= HotkeyModifiers.Alt;
+
+            if ((Win32.GetAsyncKeyState(Win32.VK_SHIFT) & 0x8000) != 0)
+                modifiers |= HotkeyModifiers.Shift;
+
+            if ((Win32.GetAsyncKeyState(Win32.VK_LWIN) & 0x8000) != 0 ||
+                (Win32.GetAsyncKeyState(Win32.VK_RWIN) & 0x8000) != 0)
+                modifiers |= HotkeyModifiers.Windows;
+
+            return modifiers;
+        }
+
+        public void Dispose()
+        {
+            Uninstall();
+        }
+    }
+}
+
+
+================================================================================
+FILE: UI\TrayIconManager.cs
+================================================================================
+using System;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Windows.Forms;
+using FocusGlow.Core;
+using FocusGlow.Models;
+using FocusGlow.Services;
+
+namespace FocusGlow.UI
+{
+    public sealed class TrayIconManager : IDisposable
+    {
+        private readonly NotifyIcon _notifyIcon;
+        private readonly FocusManager _focusManager;
+        private readonly Action _openSettingsAction;
+
+        private ToolStripMenuItem? _toggleMenuItem;
+
+        public TrayIconManager(FocusManager focusManager, Action openSettingsAction)
+        {
+            _focusManager = focusManager;
+            _openSettingsAction = openSettingsAction;
+
+            _notifyIcon = new NotifyIcon
+            {
+                Text = "FocusGlow",
+                Visible = true,
+                Icon = CreateTrayIcon()
+            };
+
+            _notifyIcon.DoubleClick += (_, _) => _openSettingsAction();
+
+            BuildContextMenu();
+
+            _focusManager.FocusStateChanged += OnFocusStateChanged;
+            ConfigManager.ConfigChanged += OnConfigChanged;
+        }
+
+        private void BuildContextMenu()
+        {
+            var menu = new ContextMenuStrip();
+
+            var settingsItem = new ToolStripMenuItem("Settings", null, (_, _) => _openSettingsAction());
+
+            string hotkeyText = ConfigManager.Current.Hotkey.DisplayText;
+            _toggleMenuItem = new ToolStripMenuItem($"Enable Focus ({hotkeyText})", null, (_, _) =>
+            {
+                _focusManager.ToggleFocus();
+            });
+
+            var exitItem = new ToolStripMenuItem("Exit", null, (_, _) =>
+            {
+                System.Windows.Application.Current.Shutdown();
+            });
+
+            menu.Items.Add(settingsItem);
+            menu.Items.Add(_toggleMenuItem);
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(exitItem);
+
+            _notifyIcon.ContextMenuStrip = menu;
+        }
+
+        private void OnConfigChanged(AppConfig config)
+        {
+            if (_toggleMenuItem != null)
+            {
+                _toggleMenuItem.Text = _focusManager.IsFocusActive
+                    ? $"Disable Focus ({config.Hotkey.DisplayText})"
+                    : $"Enable Focus ({config.Hotkey.DisplayText})";
+            }
+        }
+
+        private void OnFocusStateChanged(bool active)
+        {
+            if (_toggleMenuItem != null)
+            {
+                string hotkeyText = ConfigManager.Current.Hotkey.DisplayText;
+                _toggleMenuItem.Text = active
+                    ? $"Disable Focus ({hotkeyText})"
+                    : $"Enable Focus ({hotkeyText})";
+            }
+        }
+
+        private static Icon CreateTrayIcon()
+        {
+            using var bitmap = new Bitmap(32, 32);
+            using var g = Graphics.FromImage(bitmap);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            using var bgBrush = new SolidBrush(Color.FromArgb(24, 24, 26));
+            g.FillEllipse(bgBrush, 2, 2, 28, 28);
+
+            using var ringPen = new Pen(Color.FromArgb(235, 235, 240), 2.2f);
+            g.DrawEllipse(ringPen, 7, 7, 18, 18);
+
+            IntPtr hIcon = bitmap.GetHicon();
+            return Icon.FromHandle(hIcon);
+        }
+
+        public void Dispose()
+        {
+            _notifyIcon.Visible = false;
+            _notifyIcon.Dispose();
+        }
+    }
+}
+
+
+================================================================================
+FILE: Views\OverlayWindow.xaml
+================================================================================
+<Window x:Class="FocusGlow.Views.OverlayWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:skia="clr-namespace:SkiaSharp.Views.WPF;assembly=SkiaSharp.Views.WPF"
+        Title="FocusGlow Overlay"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        ShowInTaskbar="False"
+        Topmost="True"
+        ShowActivated="False"
+        Focusable="False">
+    <Grid Background="Transparent">
+        <skia:SKElement x:Name="SkCanvasElement" PaintSurface="OnPaintSurface" />
+    </Grid>
+</Window>
+
+
+================================================================================
+FILE: Views\OverlayWindow.xaml.cs
+================================================================================
+using System;
+using System.Diagnostics;
+using System.Windows;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
+using FocusGlow.Core;
+using FocusGlow.Interop;
+using FocusGlow.Rendering;
+using SkiaSharp.Views.Desktop;
+
+namespace FocusGlow.Views
+{
+    public partial class OverlayWindow : Window, IDisposable
+    {
+        private readonly FocusAnimationController _controller;
+        private readonly FocusOverlayRenderer _renderer;
+
+        private bool _isRendering = false;
+        private long _lastTimestamp;
+
+        public OverlayWindow(FocusAnimationController controller)
+        {
+            InitializeComponent();
+            _controller = controller;
+            _renderer = new FocusOverlayRenderer();
+
+            Loaded += OnLoaded;
+        }
+
+        private void OnLoaded(object sender, RoutedEventArgs e)
+        {
+            ApplyWindowExtendedStyles();
+        }
+
+        private void ApplyWindowExtendedStyles()
+        {
+            var helper = new WindowInteropHelper(this);
+            IntPtr hwnd = helper.Handle;
+            if (hwnd == IntPtr.Zero) return;
+
+            int exStyle = Win32.GetWindowLong(hwnd, Win32.GWL_EXSTYLE);
+            int newExStyle = exStyle |
+                             Win32.WS_EX_TOPMOST |
+                             Win32.WS_EX_TRANSPARENT |
+                             Win32.WS_EX_LAYERED |
+                             Win32.WS_EX_NOACTIVATE |
+                             Win32.WS_EX_TOOLWINDOW;
+
+            Win32.SetWindowLong(hwnd, Win32.GWL_EXSTYLE, newExStyle);
+        }
+
+        public void ActivateOverlay(IntPtr targetHwnd)
+        {
+            // Position to cover full virtual screen across all monitors
+            int vx = Win32.GetSystemMetrics(Win32.SM_XVIRTUALSCREEN);
+            int vy = Win32.GetSystemMetrics(Win32.SM_YVIRTUALSCREEN);
+            int vw = Win32.GetSystemMetrics(Win32.SM_CXVIRTUALSCREEN);
+            int vh = Win32.GetSystemMetrics(Win32.SM_CYVIRTUALSCREEN);
+
+            var helper = new WindowInteropHelper(this);
+            IntPtr hwnd = helper.EnsureHandle();
+            ApplyWindowExtendedStyles();
+
+            Win32.SetWindowPos(hwnd, Win32.HWND_TOPMOST, vx, vy, vw, vh,
+                Win32.SWP_NOACTIVATE | Win32.SWP_SHOWWINDOW);
+
+            Left = SystemParameters.VirtualScreenLeft;
+            Top = SystemParameters.VirtualScreenTop;
+            Width = SystemParameters.VirtualScreenWidth;
+            Height = SystemParameters.VirtualScreenHeight;
+
+            Show();
+
+            // Start animation controller
+            _controller.Activate(targetHwnd);
+
+            // Start 240Hz render loop
+            StartRenderLoop();
+        }
+
+        public void DeactivateOverlay()
+        {
+            StopRenderLoop();
+            Hide();
+        }
+
+        private void StartRenderLoop()
+        {
+            if (_isRendering) return;
+
+            _lastTimestamp = Stopwatch.GetTimestamp();
+            CompositionTarget.Rendering += OnCompositionRendering;
+            _isRendering = true;
+        }
+
+        private void StopRenderLoop()
+        {
+            if (!_isRendering) return;
+
+            CompositionTarget.Rendering -= OnCompositionRendering;
+            _isRendering = false;
+        }
+
+        private void OnCompositionRendering(object? sender, EventArgs e)
+        {
+            long now = Stopwatch.GetTimestamp();
+            double dt = (double)(now - _lastTimestamp) / Stopwatch.Frequency;
+            _lastTimestamp = now;
+
+            // Guard against large pauses
+            if (dt <= 0.0 || dt > 0.1) dt = 1.0 / 60.0;
+
+            _controller.Update(dt);
+
+            // Request Skia repaint on GPU
+            SkCanvasElement.InvalidateVisual();
+        }
+
+        private void OnPaintSurface(object? sender, SKPaintSurfaceEventArgs e)
+        {
+            _renderer.Render(
+                e.Surface.Canvas,
+                e.Info.Width,
+                e.Info.Height,
+                _controller.CurrentTargetRoundRect,
+                _controller.CurrentDimOpacity,
+                _controller.CurrentGlowAlpha,
+                _controller.CurrentGlowProgress
+            );
+        }
+
+        public void Dispose()
+        {
+            StopRenderLoop();
+            _renderer.Dispose();
+        }
+    }
+}
+
+
+================================================================================
+FILE: Views\SettingsWindow.xaml
+================================================================================
+<Window x:Class="FocusGlow.Views.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="FocusGlow"
+        Width="360" Height="248"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="NoResize"
+        Background="#161617"
+        Foreground="#F5F5F7"
+        FontFamily="Segoe UI Variable Text, Segoe UI">
+
+    <WindowChrome.WindowChrome>
+        <WindowChrome CaptionHeight="40"
+                      CornerRadius="10"
+                      GlassFrameThickness="-1"
+                      ResizeBorderThickness="0"
+                      UseAeroCaptionButtons="False" />
+    </WindowChrome.WindowChrome>
+
+    <Window.Resources>
+        <!-- Минималистичная кнопка-пилюля для бинда -->
+        <Style x:Key="PillButtonStyle" TargetType="Button">
+            <Setter Property="Background" Value="#242426" />
+            <Setter Property="Foreground" Value="#F5F5F7" />
+            <Setter Property="BorderBrush" Value="#343438" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Padding" Value="12,5" />
+            <Setter Property="MinWidth" Value="108" />
+            <Setter Property="FontSize" Value="12.5" />
+            <Setter Property="FontWeight" Value="Medium" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="6"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#2E2E32" />
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="#48484E" />
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#1E1E20" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Тонкий слайдер в стиле macOS -->
+        <Style x:Key="MinimalSliderStyle" TargetType="Slider">
+            <Setter Property="Width" Value="110" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Slider">
+                        <Grid Height="20" Background="Transparent">
+                            <Border Height="3" CornerRadius="1.5" Background="#2C2C30" VerticalAlignment="Center" />
+                            <Track x:Name="PART_Track">
+                                <Track.DecreaseRepeatButton>
+                                    <RepeatButton Command="Slider.DecreaseLarge" IsTabStop="False">
+                                        <RepeatButton.Template>
+                                            <ControlTemplate TargetType="RepeatButton">
+                                                <Border Height="3" CornerRadius="1.5" Background="#D1D1D6" VerticalAlignment="Center" />
+                                            </ControlTemplate>
+                                        </RepeatButton.Template>
+                                    </RepeatButton>
+                                </Track.DecreaseRepeatButton>
+                                <Track.IncreaseRepeatButton>
+                                    <RepeatButton Command="Slider.IncreaseLarge" IsTabStop="False">
+                                        <RepeatButton.Template>
+                                            <ControlTemplate TargetType="RepeatButton">
+                                                <Border Height="3" Background="Transparent" />
+                                            </ControlTemplate>
+                                        </RepeatButton.Template>
+                                    </RepeatButton>
+                                </Track.IncreaseRepeatButton>
+                                <Track.Thumb>
+                                    <Thumb>
+                                        <Thumb.Template>
+                                            <ControlTemplate TargetType="Thumb">
+                                                <Ellipse Width="12" Height="12" Fill="#F5F5F7" />
+                                            </ControlTemplate>
+                                        </Thumb.Template>
+                                    </Thumb>
+                                </Track.Thumb>
+                            </Track>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="CloseIconStyle" TargetType="Button">
+            <Setter Property="Width" Value="28" />
+            <Setter Property="Height" Value="28" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Foreground" Value="#6E6E73" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="FontSize" Value="11" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="WindowChrome.IsHitTestVisibleInChrome" Value="True" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="6">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#262629" />
+                                <Setter Property="Foreground" Value="#F5F5F7" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="22,12,22,18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="28" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- Header -->
+        <Grid Grid.Row="0">
+            <TextBlock Text="FocusGlow"
+                       FontSize="13.5"
+                       FontWeight="SemiBold"
+                       Foreground="#F5F5F7"
+                       VerticalAlignment="Center" />
+            <Button Style="{StaticResource CloseIconStyle}"
+                    Content="✕"
+                    HorizontalAlignment="Right"
+                    Click="CloseButton_Click"
+                    ToolTip="Hide to tray" />
+        </Grid>
+
+        <!-- Clean settings without card clutter -->
+        <StackPanel Grid.Row="1" VerticalAlignment="Center" Margin="0,6,0,4">
+            <!-- Activation Key -->
+            <Grid Margin="0,0,0,16">
+                <StackPanel VerticalAlignment="Center">
+                    <TextBlock Text="Activation Key" FontSize="13" Foreground="#F5F5F7" />
+                    <TextBlock Text="Keyboard shortcut or mouse side button" FontSize="11" Foreground="#6E6E73" Margin="0,2,0,0" />
+                </StackPanel>
+
+                <Button x:Name="HotkeyPillButton"
+                        Style="{StaticResource PillButtonStyle}"
+                        Content="Alt + F"
+                        HorizontalAlignment="Right"
+                        VerticalAlignment="Center"
+                        Click="RecordHotkeyButton_Click" />
+            </Grid>
+
+            <!-- Corner Radius -->
+            <Grid Margin="0,0,0,14">
+                <TextBlock Text="Corner Radius" FontSize="13" Foreground="#F5F5F7" VerticalAlignment="Center" />
+
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                    <TextBlock x:Name="CornerRadiusValueText"
+                               Text="8 px"
+                               FontSize="12"
+                               Foreground="#8E8E93"
+                               Width="36"
+                               TextAlignment="Right"
+                               Margin="0,0,10,0"
+                               VerticalAlignment="Center" />
+                    <Slider x:Name="CornerRadiusSlider"
+                            Style="{StaticResource MinimalSliderStyle}"
+                            Minimum="0" Maximum="20" Value="8"
+                            TickFrequency="1" IsSnapToTickEnabled="True"
+                            ValueChanged="CornerRadiusSlider_ValueChanged" />
+                </StackPanel>
+            </Grid>
+
+            <!-- Dimming Speed -->
+            <Grid>
+                <TextBlock Text="Dimming Speed" FontSize="13" Foreground="#F5F5F7" VerticalAlignment="Center" />
+
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                    <TextBlock x:Name="DimSpeedValueText"
+                               Text="1.0×"
+                               FontSize="12"
+                               Foreground="#8E8E93"
+                               Width="36"
+                               TextAlignment="Right"
+                               Margin="0,0,10,0"
+                               VerticalAlignment="Center" />
+                    <Slider x:Name="DimSpeedSlider"
+                            Style="{StaticResource MinimalSliderStyle}"
+                            Minimum="0.5" Maximum="2.0" Value="1.0"
+                            TickFrequency="0.1" IsSnapToTickEnabled="True"
+                            ValueChanged="DimSpeedSlider_ValueChanged" />
+                </StackPanel>
+            </Grid>
+        </StackPanel>
+
+        <!-- Hint -->
+        <TextBlock Grid.Row="2"
+                   Text="Hover over any window and press key · Esc to exit"
+                   FontSize="11"
+                   Foreground="#6E6E73"
+                   HorizontalAlignment="Center" />
+    </Grid>
+</Window>
+
+
+================================================================================
+FILE: Views\SettingsWindow.xaml.cs
+================================================================================
+using System;
+using System.ComponentModel;
+using System.Windows;
+using System.Windows.Interop;
+using System.Windows.Media;
+using FocusGlow.Input;
+using FocusGlow.Interop;
+using FocusGlow.Models;
+using FocusGlow.Services;
+using Brush = System.Windows.Media.Brush;
+using Color = System.Windows.Media.Color;
+using FocusManager = FocusGlow.Core.FocusManager;
+
+namespace FocusGlow.Views
+{
+    public partial class SettingsWindow : Window
+    {
+        private readonly GlobalInputHook _inputHook;
+        private bool _isRealClose;
+
+        private static readonly Brush DefaultPillBorder = new SolidColorBrush(Color.FromRgb(0x34, 0x34, 0x38));
+        private static readonly Brush RecordingPillBorder = new SolidColorBrush(Color.FromRgb(0xE5, 0xE5, 0xEA));
+
+        public SettingsWindow(FocusManager focusManager, GlobalInputHook inputHook)
+        {
+            InitializeComponent();
+            _inputHook = inputHook;
+            SourceInitialized += OnSourceInitialized;
+            Loaded += OnLoaded;
+        }
+
+        private void OnSourceInitialized(object? sender, EventArgs e)
+        {
+            IntPtr hwnd = new WindowInteropHelper(this).Handle;
+            if (hwnd == IntPtr.Zero) return;
+
+            int darkMode = 1;
+            Win32.DwmSetWindowAttribute(hwnd, Win32.DWMWA_USE_IMMERSIVE_DARK_MODE, ref darkMode, sizeof(int));
+
+            // Включаем нативный материал Windows 11 Mica; при неудаче остаётся чистый #161617
+            int micaBackdrop = 2;
+            if (Win32.DwmSetWindowAttribute(hwnd, Win32.DWMWA_SYSTEMBACKDROP_TYPE, ref micaBackdrop, sizeof(int)) == 0)
+            {
+                Background = System.Windows.Media.Brushes.Transparent;
+            }
+        }
+
+        private void OnLoaded(object sender, RoutedEventArgs e)
+        {
+            var config = ConfigManager.Current;
+            HotkeyPillButton.Content = config.Hotkey.DisplayText;
+            CornerRadiusSlider.Value = config.CornerRadius;
+            CornerRadiusValueText.Text = $"{(int)config.CornerRadius} px";
+            DimSpeedSlider.Value = config.DimSpeedMultiplier;
+            DimSpeedValueText.Text = $"{config.DimSpeedMultiplier:0.0}×";
+
+            ConfigManager.ConfigChanged += OnConfigChanged;
+        }
+
+        private void OnConfigChanged(AppConfig config)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                if (!_inputHook.IsRecording)
+                    HotkeyPillButton.Content = config.Hotkey.DisplayText;
+            });
+        }
+
+        private void CloseButton_Click(object sender, RoutedEventArgs e) => Hide();
+
+        protected override void OnClosing(CancelEventArgs e)
+        {
+            if (!_isRealClose)
+            {
+                e.Cancel = true;
+                Hide();
+            }
+            else
+            {
+                base.OnClosing(e);
+            }
+        }
+
+        public void RealClose()
+        {
+            _isRealClose = true;
+            Close();
+        }
+
+        private void RecordHotkeyButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_inputHook.IsRecording)
+            {
+                _inputHook.CancelRecording();
+                ResetRecordUi();
+                return;
+            }
+
+            HotkeyPillButton.Content = "Press key...";
+            HotkeyPillButton.BorderBrush = RecordingPillBorder;
+
+            _inputHook.StartRecording(newBinding =>
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    ConfigManager.Update(cfg => cfg.Hotkey = newBinding);
+                    ResetRecordUi();
+                });
+            });
+        }
+
+        private void ResetRecordUi()
+        {
+            HotkeyPillButton.BorderBrush = DefaultPillBorder;
+            HotkeyPillButton.Content = ConfigManager.Current.Hotkey.DisplayText;
+        }
+
+        private void CornerRadiusSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            if (CornerRadiusValueText == null) return;
+            float radius = (float)e.NewValue;
+            CornerRadiusValueText.Text = $"{(int)radius} px";
+            ConfigManager.Update(cfg => cfg.CornerRadius = radius);
+        }
+
+        private void DimSpeedSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            if (DimSpeedValueText == null) return;
+            double speed = Math.Round(e.NewValue, 1);
+            DimSpeedValueText.Text = $"{speed:0.0}×";
+            ConfigManager.Update(cfg => cfg.DimSpeedMultiplier = speed);
+        }
+    }
+}
+
+

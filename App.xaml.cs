@@ -29,7 +29,7 @@ namespace FocusGlow
             _singleInstanceMutex = new Mutex(true, "FocusGlow_SingleInstance_Mutex_W11", out bool isNewInstance);
             if (!isNewInstance)
             {
-                System.Windows.MessageBox.Show("FocusGlow уже запущен в системном трее.", "FocusGlow", MessageBoxButton.OK, MessageBoxImage.Information);
+                System.Windows.MessageBox.Show("FocusGlow is already running in the system tray.", "FocusGlow", MessageBoxButton.OK, MessageBoxImage.Information);
                 Shutdown();
                 return;
             }
